@@ -80,8 +80,11 @@ async fn main() {
                     Some(blocker)
                 }
                 Err(e) => {
-                    tracing::error!(error = %e, "Failed to initialize XDP");
-                    std::process::exit(1);
+                    // Non-fatal (unlike the Go version, which exits): the proxy
+                    // is fully functional without L4 acceleration, so a failed
+                    // XDP attach must not take the service down.
+                    tracing::error!(error = %e, "Failed to initialize XDP; continuing without L4 blocking");
+                    None
                 }
             }
         }

@@ -32,12 +32,12 @@ Request flow: `hyper server (main.rs) → route() → WAF Manager (waf) → Prox
 - **src/proxy.rs** — reverse proxy over a pooled `hyper_util` client with `hyper-rustls` (http+https backends). Header rewrite (preserve `Host`, append `X-Forwarded-For`, set `X-Forwarded-Host/Proto`, strip hop-by-hop, drop `Accept-Encoding` for HTML), `Server`→`ddos-proxy`, `Via`, `X-Ddos-Proxy-Cache` (HIT/MISS/DYNAMIC), redirect `Location` rewrite, and `<head>/<body>` JS injection (gzip-aware) using the byte-identical `JS_SNIPPET`. WebSocket upgrades are tunneled via a manual HTTP/1 handshake + `copy_bidirectional`.
 - **src/cache.rs** — optional disk HTTP cache (`/tmp/ddos-mitigator-cache`), honours `Cache-Control: max-age`/`s-maxage`; stores raw upstream responses pre-modify, like the Go `httpcache` layer.
 - **src/tls.rs** — on-demand ACME via **instant-acme** + **rcgen**. `OnDemandResolver` (rustls `ResolvesServerCert`) serves cached certs and triggers background issuance per SNI (with host-policy backend probe, disk cache under `certs/`, 24h renew-before, retry backoff). HTTP-01 served by the redirect server on `http_port`. Supports staging, custom directory, and EAB.
-- **src/xdp.rs** — `Blocker` trait. On Linux + `xdp` feature, `XdpBlocker` loads the precompiled `src/bpf/xdp_bpfel.o` (same bytecode as the Go build) via `aya`; elsewhere a no-op stub. `block_ip` writes the IP→1 into the `blocklist` map using the Go key encoding.
+- **src/xdp.rs** + **build.rs** — `Blocker` trait. On Linux + `xdp` feature, `build.rs` compiles `src/bpf/xdp.c` (BTF maps, clang) to `$OUT_DIR/xdp.o`; `XdpBlocker` loads it via `aya` and attaches to the interface; elsewhere a no-op stub. `block_ip` writes IP→1 into the `blocklist` map using the Go key encoding. XDP init failure is non-fatal (logged, proxy continues without L4).
 - **src/metrics.rs** — Prometheus collectors in a dedicated registry; `gather()` encodes text for `/metrics`.
 
 ## Conventions / gotchas
 
-- Editing the eBPF program means editing `old/internal/xdp/xdp.c` and regenerating, then copying the `.o` into `src/bpf/` — the Rust side loads bytecode, it does not compile C.
+- The eBPF program lives at `src/bpf/xdp.c`; `build.rs` compiles it with clang at build time (feature `xdp`). Edit the C there — no checked-in `.o`. Maps must stay in BTF `.maps` style (legacy `bpf_map_def` won't load in aya).
 - Body types unify on `body::BoxedBody`; use `body::empty()` / `body::full()`.
 - Keep parity edits anchored to `old/` — diff the Go source when changing WAF/proxy logic.
 - Known intentional deviations (documented in README): `close` block action returns an empty `403 Connection: close` instead of a raw socket close; the first TLS handshake for a new host fails while the cert issues in the background.

@@ -110,7 +110,7 @@ The Rust port reproduces the Go behaviour and configuration. A few platform-leve
 
 - **Connection close**: where Go hijacks and closes the TCP socket (block action `close`, and L4 escalation), the Rust port returns an empty `403` with `Connection: close` — hyper's nearest equivalent.
 - **On-demand TLS**: rustls' certificate resolver is synchronous, so the first TLS handshake for a brand-new host triggers background issuance and fails; the client's retry succeeds once the cert is ready (Go blocks the first handshake instead). Issued certs are cached on disk under `certs/`.
-- **eBPF/XDP**: the exact same compiled bytecode (`src/bpf/xdp_bpfel.o`) is loaded via `aya`. It is gated behind the `xdp` cargo feature and is Linux-only.
+- **eBPF/XDP**: the same C program (`src/bpf/xdp.c`, logic identical to the Go build) is compiled with clang by `build.rs` and loaded via `aya`. Gated behind the `xdp` cargo feature, Linux-only. A failed XDP attach is logged but **non-fatal** (the Go version exits) so the proxy keeps serving.
 
 ## eBPF/XDP Requirements (Docker)
 

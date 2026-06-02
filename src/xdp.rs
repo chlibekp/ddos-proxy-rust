@@ -1,9 +1,9 @@
 //! Layer-4 blocking via eBPF/XDP.
 //!
-//! Mirrors the Go `internal/xdp` package. The eBPF program itself is the exact
-//! same bytecode shipped by the Go build (`bpf_bpfel.o`), loaded at runtime with
-//! `aya` instead of `cilium/ebpf`. This keeps the kernel-side behaviour identical
-//! and avoids needing a BPF toolchain at build time.
+//! Mirrors the Go `internal/xdp` package. The eBPF program (`src/bpf/xdp.c`) is
+//! the same C source/logic as the Go build, compiled fresh with clang by
+//! `build.rs` (BTF maps so `aya` can load it) and attached at runtime via `aya`
+//! instead of `cilium/ebpf`. The kernel-side behaviour is identical.
 //!
 //! XDP is Linux-only and gated behind the `xdp` cargo feature. On every other
 //! platform / when the feature is disabled, a no-op blocker is used and all
@@ -41,8 +41,8 @@ mod imp {
     use aya::Ebpf;
     use std::sync::Mutex;
 
-    // Precompiled eBPF object (same bytecode as the Go build).
-    static BPF_OBJECT: &[u8] = include_bytes!("bpf/xdp_bpfel.o");
+    // eBPF object compiled from src/bpf/xdp.c by build.rs (clang, BTF maps).
+    static BPF_OBJECT: &[u8] = aya::include_bytes_aligned!(concat!(env!("OUT_DIR"), "/xdp.o"));
 
     #[repr(C)]
     #[derive(Clone, Copy)]
