@@ -262,10 +262,14 @@ impl ResolverInner {
             }
         }
 
-        // Finalize with a freshly generated key + CSR.
+        // Finalize with a freshly generated key + CSR. The CSR must contain only
+        // the order's DNS identifier — rcgen's default Subject sets a CommonName
+        // ("rcgen self signed cert") which some CAs (e.g. ZeroSSL) treat as an
+        // extra identifier and reject (badCSR), so clear the distinguished name.
         let key_pair = rcgen::KeyPair::generate().map_err(|e| format!("keygen: {e}"))?;
-        let params = rcgen::CertificateParams::new(vec![host.to_string()])
+        let mut params = rcgen::CertificateParams::new(vec![host.to_string()])
             .map_err(|e| format!("cert params: {e}"))?;
+        params.distinguished_name = rcgen::DistinguishedName::new();
         let csr = params
             .serialize_request(&key_pair)
             .map_err(|e| format!("csr: {e}"))?;
