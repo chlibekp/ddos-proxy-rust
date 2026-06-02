@@ -1,0 +1,23 @@
+# Rust build output
+/target
+
+# ACME certificate cache (issued at runtime)
+/certs
+
+# Disk HTTP cache
+/cache_data
+
+# Go reference build artifacts (under old/)
+old/proxy
+old/cache_data/
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+
+# Logs
+*.log
+
+# macOS
+.DS_Store

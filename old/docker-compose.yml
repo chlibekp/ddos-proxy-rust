@@ -1,0 +1,14 @@
+services:
+  ddos-proxy:
+    build: .
+    network_mode: "host"
+    cap_add:
+      - NET_ADMIN
+      - SYS_ADMIN
+      - BPF
+    environment:
+      # Optional: specify network interface for XDP hardware acceleration
+      - PROXY_XDP_INTERFACE=eth0
+      # Required: The URL of the backend service to proxy requests to
+      - PROXY_BACKEND_URL=http://localhost:8081 # Change to your actual backend URL
+    restart: unless-stopped

@@ -1,0 +1,665 @@
+mod client;
+
+pub use client::ClientState;
+
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use dashmap::DashMap;
+use http::header::{HeaderName, HeaderValue};
+use http::{Request, Response, StatusCode};
+use http_body_util::BodyExt;
+use hyper::body::Incoming;
+use minijinja::{context, Environment};
+use rand::RngCore;
+use sha2::{Digest, Sha256};
+
+use crate::body::{empty, full, BoxedBody};
+use crate::config::Config;
+use crate::limiter::RateLimiter;
+use crate::metrics;
+use crate::proxy::{Proxy, ReqCtx};
+use crate::util::{is_websocket_upgrade, now_millis, now_unix};
+use crate::xdp::Blocker;
+
+pub struct Manager {
+    cfg: Arc<Config>,
+    rl: Arc<RateLimiter>,
+    env: Environment<'static>,
+    xdp: Option<Arc<dyn Blocker>>,
+    proxy: Arc<Proxy>,
+    mitigation_until: AtomicI64, // unix seconds
+    timeout_count: AtomicI64,
+    ip_states: DashMap<String, Arc<ClientState>>,
+    ip_state_count: AtomicI64,
+}
+
+impl Manager {
+    pub fn new(
+        cfg: Arc<Config>,
+        rl: Arc<RateLimiter>,
+        template_src: String,
+        xdp: Option<Arc<dyn Blocker>>,
+        proxy: Arc<Proxy>,
+    ) -> Arc<Self> {
+        let mut env = Environment::new();
+        env.add_template_owned("challenge.html", template_src)
+            .expect("invalid challenge template");
+
+        let manager = Arc::new(Manager {
+            cfg,
+            rl,
+            env,
+            xdp,
+            proxy,
+            mitigation_until: AtomicI64::new(0),
+            timeout_count: AtomicI64::new(0),
+            ip_states: DashMap::new(),
+            ip_state_count: AtomicI64::new(0),
+        });
+
+        // Cleanup ticker (10s cadence), mirroring Go.
+        let weak = Arc::downgrade(&manager);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(10));
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let Some(m) = weak.upgrade() else { break };
+                m.cleanup();
+            }
+        });
+
+        manager
+    }
+
+    fn prom(&self) -> bool {
+        self.cfg.prometheus_enabled
+    }
+
+    pub fn config(&self) -> &Arc<Config> {
+        &self.cfg
+    }
+
+    fn get_client_ip<B>(&self, req: &Request<B>, ctx: &ReqCtx) -> String {
+        if self.cfg.cloudflare_support {
+            if let Some(cf) = req
+                .headers()
+                .get("cf-connecting-ip")
+                .and_then(|v| v.to_str().ok())
+            {
+                if !cf.is_empty() {
+                    return cf.to_string();
+                }
+            }
+        }
+        if self.cfg.use_forwarded_for {
+            if let Some(fwd) = req
+                .headers()
+                .get("x-forwarded-for")
+                .and_then(|v| v.to_str().ok())
+            {
+                if !fwd.is_empty() {
+                    let first = fwd.split(',').next().unwrap_or("").trim();
+                    if !first.is_empty() {
+                        return first.to_string();
+                    }
+                }
+            }
+        }
+        // RemoteAddr → strip port.
+        strip_port(&ctx.remote_addr)
+    }
+
+    fn get_client_state(&self, ip: &str, host: &str) -> Option<Arc<ClientState>> {
+        let h = strip_port(host);
+        let key = format!("{ip}|{h}");
+
+        if let Some(existing) = self.ip_states.get(&key) {
+            return Some(existing.clone());
+        }
+
+        if self.cfg.max_ip_states > 0
+            && self.ip_state_count.load(Ordering::SeqCst) >= self.cfg.max_ip_states
+        {
+            return None;
+        }
+
+        let state = Arc::new(ClientState::default());
+        state.last_seen.store(now_unix(), Ordering::SeqCst);
+        match self.ip_states.entry(key) {
+            dashmap::mapref::entry::Entry::Occupied(e) => Some(e.get().clone()),
+            dashmap::mapref::entry::Entry::Vacant(e) => {
+                let arc = state.clone();
+                e.insert(state);
+                self.ip_state_count.fetch_add(1, Ordering::SeqCst);
+                Some(arc)
+            }
+        }
+    }
+
+    fn block_l4(&self, ip: &str) {
+        if let Some(x) = &self.xdp {
+            tracing::info!(ip = ip, "Blocking IP on L4 via XDP");
+            if let Err(e) = x.block_ip(ip) {
+                tracing::error!(ip = ip, error = %e, "Failed to add XDP block rule");
+            }
+        }
+    }
+
+    fn unblock_l4(&self, ip: &str) {
+        if let Some(x) = &self.xdp {
+            tracing::info!(ip = ip, "Unblocking IP on L4 via XDP");
+            if let Err(e) = x.unblock_ip(ip) {
+                tracing::error!(ip = ip, error = %e, "Failed to remove XDP block rule");
+            }
+        }
+    }
+
+    fn cleanup(&self) {
+        let now_s = now_unix();
+        let now_ms = now_millis();
+        let mitigation_end = self.mitigation_until.load(Ordering::SeqCst);
+        let attack_ended = now_s > mitigation_end;
+        let verify_ms = self.cfg.verify_time.as_millis() as i64;
+
+        self.timeout_count.store(0, Ordering::SeqCst);
+
+        let mut to_delete: Vec<String> = Vec::new();
+        let mut to_unblock: Vec<String> = Vec::new();
+
+        for entry in self.ip_states.iter() {
+            let key = entry.key().clone();
+            let state = entry.value();
+            let mut inner = state.inner.lock().unwrap();
+
+            // Expire verification.
+            if inner.verified && now_ms - inner.verified_at_ms > verify_ms {
+                inner.verified = false;
+                state.verified_flag.store(false, Ordering::SeqCst);
+            }
+
+            if attack_ended && !self.cfg.always_on && !inner.verified {
+                to_delete.push(key);
+                continue;
+            }
+
+            // Unblock after 5 minutes.
+            if inner.blocked && now_ms - inner.blocked_at_ms > 5 * 60 * 1000 {
+                inner.blocked = false;
+                state.blocked_flag.store(false, Ordering::SeqCst);
+                inner.violation_count = 0;
+                inner.challenge_served = false;
+                inner.error_count = 0;
+                if inner.l4_blocked {
+                    inner.l4_blocked = false;
+                    if let Some(ip) = key.split('|').next() {
+                        to_unblock.push(ip.to_string());
+                    }
+                }
+            }
+
+            // Evict idle unverified entries.
+            if !inner.verified && now_s - state.last_seen.load(Ordering::SeqCst) > 10 * 60 {
+                to_delete.push(key.clone());
+            }
+        }
+
+        for key in to_delete {
+            if self.ip_states.remove(&key).is_some() {
+                self.ip_state_count.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        for ip in to_unblock {
+            self.unblock_l4(&ip);
+        }
+    }
+
+    fn render_challenge(&self, err: &str, site_key: &str, original_url: &str, salt: &str) -> String {
+        let tmpl = self.env.get_template("challenge.html").unwrap();
+        tmpl.render(context! {
+            error => err,
+            site_key => site_key,
+            original_url => original_url,
+            pow_salt => salt,
+            pow_difficulty => self.cfg.pow_difficulty,
+        })
+        .unwrap_or_default()
+    }
+
+    fn serve_challenge(&self, ip: &str, host: &str, original_url: &str, err: &str) -> Response<BoxedBody> {
+        let salt = match self.get_client_state(ip, host) {
+            Some(state) => {
+                let mut inner = state.inner.lock().unwrap();
+                if inner.pow_salt.is_empty() {
+                    inner.pow_salt = random_hex_16();
+                }
+                inner.challenge_served_at_ms = now_millis();
+                inner.pow_salt.clone()
+            }
+            None => random_hex_16(),
+        };
+
+        let body = self.render_challenge(err, &self.cfg.turnstile_site_key, original_url, &salt);
+
+        if self.prom() {
+            metrics::challenged();
+        }
+
+        let mut resp = Response::new(full(body));
+        *resp.status_mut() = StatusCode::IM_A_TEAPOT;
+        let h = resp.headers_mut();
+        h.insert(HeaderName::from_static("x-mitigation"), HeaderValue::from_static("challenge"));
+        h.insert(
+            http::header::CACHE_CONTROL,
+            HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+        );
+        h.insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("text/html; charset=utf-8"),
+        );
+        resp
+    }
+
+    /// Main WAF entry point.
+    pub async fn handle(self: &Arc<Self>, req: Request<Incoming>, ctx: ReqCtx) -> Response<BoxedBody> {
+        if is_websocket_upgrade(&req) {
+            return self.proxy.handle(req, &ctx).await;
+        }
+
+        let ua = req
+            .headers()
+            .get(http::header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        // Whitelisted UA check.
+        if !self.cfg.whitelisted_ua.is_empty() {
+            for wua in &self.cfg.whitelisted_ua {
+                if ua.contains(wua.as_str()) {
+                    if self.rl.get_whitelist_req_count() >= self.cfg.whitelist_rate_limit {
+                        if self.prom() {
+                            metrics::dropped("whitelist_rate_limit");
+                        }
+                        return text_response(StatusCode::TOO_MANY_REQUESTS, "Rate Limit Exceeded");
+                    }
+                    self.rl.inc_whitelist_req();
+                    if self.prom() {
+                        metrics::allowed("whitelist");
+                    }
+                    return self.proxy.handle(req, &ctx).await;
+                }
+            }
+        }
+
+        let ip = self.get_client_ip(&req, &ctx);
+        let host = req
+            .headers()
+            .get(http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        let original_url = req
+            .uri()
+            .path_and_query()
+            .map(|p| p.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string());
+        let path = req.uri().path().to_string();
+
+        let now_s = now_unix();
+        let now_ms = now_millis();
+
+        let state = match self.get_client_state(&ip, &host) {
+            Some(s) => s,
+            None => {
+                // ipStates cap hit — serve challenge without tracking.
+                return self.serve_challenge(&ip, &host, &original_url, "");
+            }
+        };
+        state.last_seen.store(now_s, Ordering::SeqCst);
+
+        // ── Blocked fast-path ────────────────────────────────────────────
+        if state.blocked_flag.load(Ordering::SeqCst) {
+            let mut inner = state.inner.lock().unwrap();
+            if inner.blocked {
+                if !self.cfg.cloudflare_support && !self.cfg.use_forwarded_for {
+                    if !inner.l4_blocked {
+                        inner.error_count += 1;
+                        if inner.error_count > 5 {
+                            inner.l4_blocked = true;
+                            drop(inner);
+                            self.block_l4(&ip);
+                            return close_response();
+                        }
+                        // else fall through to block action
+                    } else {
+                        drop(inner);
+                        return close_response();
+                    }
+                }
+                drop(inner);
+                if self.prom() {
+                    metrics::dropped("blocked_ip");
+                }
+                if self.cfg.block_action == "close" {
+                    return close_response();
+                }
+                return forbidden_response();
+            }
+        }
+
+        // ── Verified fast-path ───────────────────────────────────────────
+        if state.verified_flag.load(Ordering::SeqCst)
+            && now_s < state.verified_until.load(Ordering::SeqCst)
+        {
+            if self.prom() {
+                metrics::allowed("verified");
+            }
+            return self.proxy.handle(req, &ctx).await;
+        }
+
+        // Expire stale verified state under lock (no await while holding the guard).
+        let serve_verified = {
+            let mut inner = state.inner.lock().unwrap();
+            if inner.verified {
+                if now_ms - inner.verified_at_ms < self.cfg.verify_time.as_millis() as i64 {
+                    true
+                } else {
+                    inner.verified = false;
+                    state.verified_flag.store(false, Ordering::SeqCst);
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        if serve_verified {
+            if self.prom() {
+                metrics::allowed("verified");
+            }
+            return self.proxy.handle(req, &ctx).await;
+        }
+
+        if path == "/challenge/verify" {
+            return self.verify_challenge(req, &ctx).await;
+        }
+
+        // Global rate-limit / mitigation evaluation.
+        let (req_rate, conn_rate) = self.rl.get_counts();
+        let mitigation_until = self.mitigation_until.load(Ordering::SeqCst);
+        let mitigation_secs = self.cfg.mitigation_time.as_secs() as i64;
+        let mut should_serve_challenge = self.cfg.always_on;
+
+        if req_rate >= self.cfg.max_req_per_sec || conn_rate >= self.cfg.max_conn_per_sec {
+            self.mitigation_until
+                .store(now_s + mitigation_secs, Ordering::SeqCst);
+            should_serve_challenge = true;
+        } else if now_s < mitigation_until {
+            should_serve_challenge = true;
+        } else if self.cfg.auto_mitigation_on_timeout
+            && self.timeout_count.load(Ordering::SeqCst) >= self.cfg.max_timeouts
+        {
+            self.mitigation_until
+                .store(now_s + mitigation_secs, Ordering::SeqCst);
+            should_serve_challenge = true;
+        }
+
+        if should_serve_challenge {
+            let mut inner = state.inner.lock().unwrap();
+            if !inner.challenge_served {
+                inner.challenge_served = true;
+                inner.violation_count = 0;
+            } else {
+                inner.violation_count += 1;
+                if inner.violation_count > self.cfg.max_failed_challenges {
+                    inner.blocked = true;
+                    inner.blocked_at_ms = now_ms;
+                    state.blocked_flag.store(true, Ordering::SeqCst);
+                    drop(inner);
+                    if self.prom() {
+                        metrics::dropped("challenge_violation");
+                    }
+                    if self.cfg.block_action == "close" {
+                        return close_response();
+                    }
+                    return forbidden_response();
+                }
+            }
+            drop(inner);
+            return self.serve_challenge(&ip, &host, &original_url, "");
+        }
+
+        self.rl.inc_req();
+        if self.prom() {
+            metrics::allowed("normal");
+        }
+
+        if self.cfg.auto_mitigation_on_timeout {
+            let start = Instant::now();
+            let resp = self.proxy.handle(req, &ctx).await;
+            let duration = start.elapsed();
+            let status = resp.status();
+            if duration >= self.cfg.timeout_threshold
+                || status == StatusCode::GATEWAY_TIMEOUT
+                || status == StatusCode::BAD_GATEWAY
+            {
+                let count = self.timeout_count.fetch_add(1, Ordering::SeqCst) + 1;
+                if count >= self.cfg.max_timeouts {
+                    self.mitigation_until
+                        .store(now_unix() + mitigation_secs, Ordering::SeqCst);
+                }
+            }
+            resp
+        } else {
+            self.proxy.handle(req, &ctx).await
+        }
+    }
+
+    async fn verify_challenge(&self, req: Request<Incoming>, ctx: &ReqCtx) -> Response<BoxedBody> {
+        if req.method() != http::Method::POST {
+            return text_response(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed");
+        }
+
+        let ip = self.get_client_ip(&req, ctx);
+        let host = req
+            .headers()
+            .get(http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+
+        // Read and parse form body.
+        let body_bytes = match req.into_body().collect().await {
+            Ok(c) => c.to_bytes(),
+            Err(_) => {
+                if self.prom() {
+                    metrics::dropped("challenge_invalid_form");
+                }
+                return self.serve_challenge(&ip, &host, "", "Invalid form data");
+            }
+        };
+        let form = parse_form(&body_bytes);
+        let get = |k: &str| form.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+
+        if !self.cfg.turnstile_site_key.is_empty() {
+            let token = get("cf-turnstile-response").unwrap_or_default();
+            if token.is_empty() {
+                if self.prom() {
+                    metrics::dropped("challenge_empty_token");
+                }
+                return self.serve_challenge(&ip, &host, "", "Please complete the CAPTCHA");
+            }
+            if !self.verify_turnstile(&token, &ip).await {
+                if self.prom() {
+                    metrics::dropped("challenge_verification_failed");
+                }
+                return self.serve_challenge(&ip, &host, "", "CAPTCHA verification failed");
+            }
+        } else {
+            let nonce = get("pow_nonce").unwrap_or_default();
+            if nonce.is_empty() {
+                if self.prom() {
+                    metrics::dropped("challenge_empty_pow");
+                }
+                return self.serve_challenge(&ip, &host, "", "Please complete the PoW");
+            }
+            let state = match self.get_client_state(&ip, &host) {
+                Some(s) => s,
+                None => return self.serve_challenge(&ip, &host, "", "Invalid challenge session"),
+            };
+            let (salt, served_at) = {
+                let inner = state.inner.lock().unwrap();
+                (inner.pow_salt.clone(), inner.challenge_served_at_ms)
+            };
+            if salt.is_empty() {
+                return self.serve_challenge(&ip, &host, "", "Invalid challenge session");
+            }
+            if now_millis() - served_at < 2000 {
+                if self.prom() {
+                    metrics::dropped("challenge_too_fast");
+                }
+                return self.serve_challenge(
+                    &ip,
+                    &host,
+                    "",
+                    "Challenge solved too quickly, please try again",
+                );
+            }
+            let mut hasher = Sha256::new();
+            hasher.update(format!("{salt}{nonce}").as_bytes());
+            let hash_hex = hex::encode(hasher.finalize());
+            let target_prefix = "0".repeat(self.cfg.pow_difficulty);
+            if !hash_hex.starts_with(&target_prefix) {
+                if self.prom() {
+                    metrics::dropped("challenge_pow_failed");
+                }
+                return self.serve_challenge(&ip, &host, "", "PoW verification failed");
+            }
+        }
+
+        // Mark IP as verified.
+        if let Some(state) = self.get_client_state(&ip, &host) {
+            let now_ms = now_millis();
+            {
+                let mut inner = state.inner.lock().unwrap();
+                inner.violation_count = 0;
+                inner.challenge_served = false;
+                inner.blocked = false;
+                inner.verified = true;
+                inner.verified_at_ms = now_ms;
+                inner.pow_salt = String::new();
+            }
+            state.blocked_flag.store(false, Ordering::SeqCst);
+            state.verified_flag.store(true, Ordering::SeqCst);
+            state.verified_until.store(
+                now_unix() + self.cfg.verify_time.as_secs() as i64,
+                Ordering::SeqCst,
+            );
+        }
+
+        let original_url = {
+            let u = get("original_url").unwrap_or_default();
+            if u.is_empty() {
+                "/".to_string()
+            } else {
+                u
+            }
+        };
+
+        if self.prom() {
+            metrics::allowed("challenge_solved");
+        }
+
+        redirect_found(&original_url)
+    }
+
+    async fn verify_turnstile(&self, token: &str, remote_ip: &str) -> bool {
+        let params = [
+            ("secret", self.cfg.turnstile_secret_key.as_str()),
+            ("response", token),
+            ("remoteip", remote_ip),
+        ];
+        let client = reqwest::Client::new();
+        let resp = match client
+            .post("https://challenges.cloudflare.com/turnstile/v0/siteverify")
+            .form(&params)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(error = %e, "Turnstile verification failed");
+                return false;
+            }
+        };
+        #[derive(serde::Deserialize)]
+        struct Tr {
+            success: bool,
+        }
+        match resp.json::<Tr>().await {
+            Ok(t) => t.success,
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to decode Turnstile response");
+                false
+            }
+        }
+    }
+}
+
+fn strip_port(addr: &str) -> String {
+    // Strip a trailing ":port" if present (handles host:port and ip:port).
+    match addr.rsplit_once(':') {
+        Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) && !port.is_empty() => {
+            host.trim_matches(|c| c == '[' || c == ']').to_string()
+        }
+        _ => addr.to_string(),
+    }
+}
+
+fn parse_form(body: &[u8]) -> Vec<(String, String)> {
+    url::form_urlencoded::parse(body)
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect()
+}
+
+fn random_hex_16() -> String {
+    let mut b = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut b);
+    hex::encode(b)
+}
+
+fn text_response(status: StatusCode, msg: &str) -> Response<BoxedBody> {
+    let mut resp = Response::new(full(format!("{msg}\n")));
+    *resp.status_mut() = status;
+    resp.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    resp
+}
+
+fn forbidden_response() -> Response<BoxedBody> {
+    text_response(StatusCode::FORBIDDEN, "Forbidden")
+}
+
+/// Equivalent of hijack-and-close: an empty 403 that closes the connection.
+/// (Go closes the TCP connection directly; hyper's nearest equivalent is an
+/// empty response with `Connection: close`.)
+fn close_response() -> Response<BoxedBody> {
+    let mut resp = Response::new(empty());
+    *resp.status_mut() = StatusCode::FORBIDDEN;
+    resp.headers_mut()
+        .insert(http::header::CONNECTION, HeaderValue::from_static("close"));
+    resp
+}
+
+fn redirect_found(location: &str) -> Response<BoxedBody> {
+    let mut resp = Response::new(empty());
+    *resp.status_mut() = StatusCode::FOUND;
+    if let Ok(hv) = HeaderValue::from_str(location) {
+        resp.headers_mut().insert(http::header::LOCATION, hv);
+    }
+    resp
+}

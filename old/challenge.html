@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" href="data:,">
+    {{if .SiteKey}}
+    <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+    <script>
+        function submitForm() {
+            document.getElementById("challenge-form").submit();
+        }
+    </script>
+    {{else}}
+    <script>
+        async function sha256(message) {
+            const msgBuffer = new TextEncoder().encode(message);
+            const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
+            const hashArray = Array.from(new Uint8Array(hashBuffer));
+            return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+        }
+
+        async function solvePoWSingleThread(salt, targetPrefix, startTime) {
+            let nonce = 0;
+
+            while (true) {
+                const hash = await sha256(salt + nonce);
+                if (hash.startsWith(targetPrefix)) {
+                    const elapsed = Date.now() - startTime;
+                    if (elapsed < 2000) {
+                        await new Promise(resolve => setTimeout(resolve, 2000 - elapsed));
+                    }
+                    document.getElementById("pow-nonce").value = nonce;
+                    document.getElementById("challenge-form").submit();
+                    return;
+                }
+                nonce++;
+                if (nonce % 1000 === 0) {
+                    await new Promise(resolve => setTimeout(resolve, 0));
+                }
+            }
+        }
+
+        function createPoWWorkerURL() {
+            const workerSource = `
+                self.onmessage = async function(event) {
+                    const { salt, targetPrefix, startNonce, step } = event.data;
+                    const encoder = new TextEncoder();
+                    let nonce = startNonce;
+
+                    while (true) {
+                        const msgBuffer = encoder.encode(salt + nonce);
+                        const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
+                        const hashArray = Array.from(new Uint8Array(hashBuffer));
+                        const hash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+
+                        if (hash.startsWith(targetPrefix)) {
+                            self.postMessage({ nonce: nonce });
+                            return;
+                        }
+
+                        nonce += step;
+                    }
+                };
+            `;
+
+            return URL.createObjectURL(new Blob([workerSource], { type: "application/javascript" }));
+        }
+
+        async function solvePoW() {
+            const startTime = Date.now();
+            const form = document.getElementById("challenge-form");
+            const salt = form.dataset.powSalt;
+            const targetPrefix = "0".repeat(parseInt(form.dataset.powDifficulty, 10));
+
+            if (typeof Worker === "undefined" || typeof URL.createObjectURL !== "function") {
+                await solvePoWSingleThread(salt, targetPrefix, startTime);
+                return;
+            }
+
+            const maxWorkers = 8;
+            const availableCores = navigator.hardwareConcurrency || 4;
+            const workerCount = Math.max(1, Math.min(maxWorkers, availableCores));
+            const statusElement = document.querySelector(".status");
+
+            const workerURL = createPoWWorkerURL();
+            const workers = [];
+            let solved = false;
+
+            const cleanup = function() {
+                for (const worker of workers) {
+                    worker.terminate();
+                }
+                URL.revokeObjectURL(workerURL);
+            };
+
+            for (let i = 0; i < workerCount; i++) {
+                const worker = new Worker(workerURL);
+                workers.push(worker);
+
+                worker.onmessage = async function(event) {
+                    if (solved) {
+                        return;
+                    }
+                    solved = true;
+                    cleanup();
+
+                    const elapsed = Date.now() - startTime;
+                    if (elapsed < 2000) {
+                        await new Promise(resolve => setTimeout(resolve, 2000 - elapsed));
+                    }
+
+                    document.getElementById("pow-nonce").value = event.data.nonce;
+                    form.submit();
+                };
+
+                worker.onerror = async function() {
+                    if (solved) {
+                        return;
+                    }
+                    solved = true;
+                    cleanup();
+                    await solvePoWSingleThread(salt, targetPrefix, startTime);
+                };
+
+                worker.postMessage({
+                    salt: salt,
+                    targetPrefix: targetPrefix,
+                    startNonce: i,
+                    step: workerCount
+                });
+            }
+        }
+
+        window.onload = function() {
+            solvePoW();
+        };
+    </script>
+    {{end}}
+    <style>
+        body {
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            background: #000000;
+            color: #ffffff;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            font-size: 16px;
+            line-height: 1.4;
+            position: relative;
+        }
+        #challenge-form {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 18px;
+        }
+        .status {
+            position: relative;
+            font-size: 1.6rem;
+            font-weight: 500;
+            letter-spacing: 0.01em;
+            color: #7a7a7a;
+            text-align: center;
+            padding: 0 24px;
+            background: linear-gradient(90deg, #666666 0%, #666666 35%, #ffffff 50%, #666666 65%, #666666 100%);
+            background-size: 220% 100%;
+            background-position: 120% 50%;
+            -webkit-background-clip: text;
+            background-clip: text;
+            -webkit-text-fill-color: transparent;
+            animation: status-blink 1.8s ease-in-out infinite, status-shimmer 2.4s linear infinite;
+        }
+        @keyframes status-blink {
+            0%, 100% {
+                opacity: 0.72;
+            }
+            50% {
+                opacity: 1;
+            }
+        }
+        @keyframes status-shimmer {
+            0% {
+                background-position: 120% 50%;
+            }
+            100% {
+                background-position: -20% 50%;
+            }
+        }
+        .cf-turnstile {
+            margin: 0;
+        }
+        .footer {
+            position: absolute;
+            bottom: 28px;
+            left: 50%;
+            transform: translateX(-50%);
+            font-size: 0.9rem;
+            color: #666666;
+            text-align: center;
+            width: calc(100% - 40px);
+        }
+        .footer a {
+            color: #aaaaaa;
+            text-decoration: none;
+        }
+        .footer a:hover {
+            color: #ffffff;
+        }
+        @media (max-width: 600px) {
+            body {
+                font-size: 18px;
+            }
+            .status {
+                font-size: 1.35rem;
+                padding: 0 20px;
+            }
+            .footer {
+                font-size: 1.1rem;
+                bottom: 24px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <form id="challenge-form" method="POST" action="/challenge/verify" data-pow-salt="{{.PoWSalt}}" data-pow-difficulty="{{.PoWDifficulty}}">
+        <div class="status">Checking your browser</div>
+        <input type="hidden" name="original_url" value="{{.OriginalURL}}">
+        {{if .SiteKey}}
+        <div class="cf-turnstile" data-sitekey="{{.SiteKey}}" data-callback="submitForm"></div>
+        {{else}}
+        <input type="hidden" name="pow_nonce" id="pow-nonce" value="">
+        {{end}}
+    </form>
+    <div class="footer">
+        <span>DDoS protection by <a href="https://hegy.xyz" target="_blank" rel="noopener noreferrer">Hegy.xyz</a></span>
+    </div>
+</body>
+</html>

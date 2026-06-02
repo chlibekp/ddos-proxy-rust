@@ -1,0 +1,19 @@
+services:
+  ddos-proxy:
+    build:
+      context: .
+      args:
+        # Set to "xdp" to compile in eBPF/XDP Layer-4 blocking (Linux only).
+        FEATURES: ""
+    network_mode: "host"
+    cap_add:
+      - NET_ADMIN
+      - SYS_ADMIN
+      - BPF
+    environment:
+      # Required: the URL of the backend service to proxy requests to.
+      - PROXY_BACKEND_URL=http://localhost:8081 # Change to your actual backend URL
+      # Optional: network interface for XDP hardware acceleration.
+      # Requires building with FEATURES=xdp (see build.args above).
+      # - PROXY_XDP_INTERFACE=eth0
+    restart: unless-stopped
