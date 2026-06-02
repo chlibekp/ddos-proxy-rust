@@ -19,5 +19,8 @@ old/cache_data/
 # Logs
 *.log
 
+# Secrets — real env (commit .env.example instead)
+.env
+
 # macOS
 .DS_Store
