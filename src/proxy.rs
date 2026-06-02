@@ -56,11 +56,14 @@ pub struct Proxy {
 
 impl Proxy {
     pub fn new(target: Uri, cfg: Arc<Config>) -> Self {
+        // Talk HTTP/1.1 to the backend (the inbound side may be HTTP/2 via ALPN,
+        // but the backend hop is negotiated independently). Negotiating only
+        // http/1.1 keeps outbound requests and the connection in sync.
         let https = hyper_rustls::HttpsConnectorBuilder::new()
             .with_native_roots()
             .expect("native roots")
             .https_or_http()
-            .enable_all_versions()
+            .enable_http1()
             .build();
 
         let client: ProxyClient = Client::builder(TokioExecutor::new())
@@ -196,6 +199,9 @@ impl Proxy {
         original_host: &str,
     ) -> Result<Request<BoxedBody>, Response<BoxedBody>> {
         let (mut parts, body) = req.into_parts();
+
+        // Force HTTP/1.1 for the backend hop (inbound may be HTTP/2 via ALPN).
+        parts.version = http::Version::HTTP_11;
 
         // Compose target URI: backend scheme/authority + inbound path&query.
         let path_and_query = parts
@@ -484,6 +490,7 @@ impl Proxy {
         };
         let mut out_parts = parts;
         out_parts.uri = out_uri;
+        out_parts.version = http::Version::HTTP_11;
         let outbound = Request::from_parts(out_parts, empty());
 
         // Note: TLS to backend (wss) not implemented; ws:// supported.
