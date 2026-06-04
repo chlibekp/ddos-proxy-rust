@@ -147,7 +147,7 @@
             margin: 0;
             background: #000000;
             color: #ffffff;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            font-family: system-ui, sans-serif;
             font-size: 16px;
             line-height: 1.4;
             position: relative;
@@ -160,7 +160,7 @@
         }
         .status {
             position: relative;
-            font-family: "SFMono-Regular", "SF Mono", Menlo, Consolas, "Courier New", monospace;
+            font-family: system-ui, sans-serif;
             font-size: 1.35rem;
             font-weight: 500;
             letter-spacing: 0.32em;
@@ -202,7 +202,7 @@
             height: 100%;
             z-index: -1;
             pointer-events: none;
-            opacity: 0.38;
+            opacity: 0.26;
             image-rendering: pixelated;
             image-rendering: crisp-edges;
             /* Clear the center so the fractal never sits behind the text. */
@@ -220,7 +220,7 @@
             bottom: 28px;
             left: 50%;
             transform: translateX(-50%);
-            font-family: "SFMono-Regular", "SF Mono", Menlo, Consolas, "Courier New", monospace;
+            font-family: system-ui, sans-serif;
             font-size: 0.78rem;
             letter-spacing: 0.22em;
             text-transform: uppercase;
@@ -264,7 +264,7 @@
             var MAX_ITER = 88;
             var LOG2 = Math.LN2;
             // Throttle so the animation never starves the PoW workers.
-            var FPS = 6;
+            var FPS = 24;
             var frameInterval = 1000 / FPS;
 
             var w = 1, h = 1, img = null, data = null, aspect = 1;
@@ -279,45 +279,47 @@
                 aspect = w / h;
             }
 
+            // Number of mirrored wedges around the center.
+            var SEGMENTS = 12;
+            var TWO_PI = Math.PI * 2;
+            var SEG_ANG = TWO_PI / SEGMENTS;
+            var HALF_SEG = SEG_ANG * 0.5;
+
             function render(t) {
-                // Animate the Julia constant, staying in the dendritic region
-                // (self-similar branching filaments = recognizably fractal).
-                var ang = t * 0.00009;
-                var cX = -0.77 + 0.035 * Math.cos(ang);
-                var cY = 0.135 + 0.035 * Math.sin(ang);
-                // Gentle breathing zoom + pan.
-                var zoom = 2.6 + 0.3 * Math.sin(t * 0.00006);
-                var panX = 0.18 * Math.sin(t * 0.00004);
-                var panY = 0.18 * Math.cos(t * 0.000035);
+                // Slow global rotation + breathing zoom keep the kaleidoscope alive.
+                var rot = t * 0.00012;
+                var zoom = 3.4 + 0.9 * Math.sin(t * 0.00007);
+                var cx = w * 0.5, cy = h * 0.5;
 
                 for (var py = 0; py < h; py++) {
                     for (var px = 0; px < w; px++) {
-                        var zx = (px / w - 0.5) * zoom * aspect + panX;
-                        var zy = (py / h - 0.5) * zoom + panY;
+                        // Pixel -> centered coords (correct aspect so wedges stay round).
+                        var dx = (px - cx) / h;
+                        var dy = (py - cy) / h;
 
-                        var x = zx, y = zy, i = 0, mag = 0;
-                        for (; i < MAX_ITER; i++) {
-                            var x2 = x * x - y * y + cX;
-                            y = 2 * x * y + cY;
-                            x = x2;
-                            mag = x * x + y * y;
-                            if (mag > 256) break;
-                        }
+                        var r = Math.sqrt(dx * dx + dy * dy);
+                        var a = Math.atan2(dy, dx) + rot;
 
-                        var c;
-                        if (i >= MAX_ITER) {
-                            // Interior: very dark, faint inner glow keeps the body present.
-                            c = 0.04;
-                        } else {
-                            // Smooth (continuous) escape count -> clean fractal contours.
-                            var nu = i + 1 - Math.log(Math.log(mag) * 0.5) / LOG2;
-                            // Self-similar contour bands following the boundary filaments.
-                            var band = 0.5 + 0.5 * Math.sin(nu * 0.75 + t * 0.0004);
-                            var depth = nu / MAX_ITER;        // bright near the boundary
-                            c = Math.pow(band, 1.2) * Math.pow(depth, 0.4);
-                        }
+                        // Fold angle into one wedge, then mirror -> kaleidoscope symmetry.
+                        a = a % SEG_ANG;
+                        if (a < 0) a += SEG_ANG;
+                        if (a > HALF_SEG) a = SEG_ANG - a;
 
-                        var g = Math.min(255, 22 + c * 110);
+                        // Sample a repeating pattern in the folded (r, a) space.
+                        var u = r * zoom;
+                        var sx = u * Math.cos(a);
+                        var sy = u * Math.sin(a);
+
+                        var p1 = Math.sin(sx * 3.0 + t * 0.0006);
+                        var p2 = Math.sin(sy * 3.0 - t * 0.0005);
+                        var p3 = Math.sin((sx + sy) * 2.2 + t * 0.0004);
+                        var rings = Math.sin(u * 6.0 - t * 0.0008);
+
+                        var v = (p1 + p2 + p3 + rings) * 0.25; // -1..1
+                        var c = 0.5 + 0.5 * v;
+                        c = Math.pow(c, 1.6); // boost contrast, keep mostly dark
+
+                        var g = Math.min(255, 14 + c * 64);
                         var idx = (py * w + px) * 4;
                         data[idx]     = g; // R
                         data[idx + 1] = g; // G
