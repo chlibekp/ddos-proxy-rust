@@ -160,13 +160,17 @@
         }
         .status {
             position: relative;
-            font-size: 1.6rem;
+            font-family: "SFMono-Regular", "SF Mono", Menlo, Consolas, "Courier New", monospace;
+            font-size: 1.35rem;
             font-weight: 500;
-            letter-spacing: 0.01em;
-            color: #7a7a7a;
+            letter-spacing: 0.32em;
+            text-indent: 0.32em;
+            text-transform: uppercase;
+            color: #777777;
             text-align: center;
             padding: 0 24px;
-            background: linear-gradient(90deg, #666666 0%, #666666 35%, #ffffff 50%, #666666 65%, #666666 100%);
+            /* Grayscale shimmer. */
+            background: linear-gradient(90deg, #555555 0%, #555555 35%, #ffffff 50%, #555555 65%, #555555 100%);
             background-size: 220% 100%;
             background-position: 120% 50%;
             -webkit-background-clip: text;
@@ -190,6 +194,24 @@
                 background-position: -20% 50%;
             }
         }
+        #bg {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            z-index: -1;
+            pointer-events: none;
+            opacity: 0.38;
+            image-rendering: pixelated;
+            image-rendering: crisp-edges;
+            /* Clear the center so the fractal never sits behind the text. */
+            -webkit-mask-image: radial-gradient(ellipse 42% 38% at center, transparent 0%, transparent 30%, #000 72%);
+            mask-image: radial-gradient(ellipse 42% 38% at center, transparent 0%, transparent 30%, #000 72%);
+        }
+        #challenge-form, .footer {
+            z-index: 1;
+        }
         .cf-turnstile {
             margin: 0;
         }
@@ -198,13 +220,16 @@
             bottom: 28px;
             left: 50%;
             transform: translateX(-50%);
-            font-size: 0.9rem;
-            color: #666666;
+            font-family: "SFMono-Regular", "SF Mono", Menlo, Consolas, "Courier New", monospace;
+            font-size: 0.78rem;
+            letter-spacing: 0.22em;
+            text-transform: uppercase;
+            color: #555555;
             text-align: center;
             width: calc(100% - 40px);
         }
         .footer a {
-            color: #aaaaaa;
+            color: #999999;
             text-decoration: none;
         }
         .footer a:hover {
@@ -215,17 +240,119 @@
                 font-size: 18px;
             }
             .status {
-                font-size: 1.35rem;
+                font-size: 1.05rem;
+                letter-spacing: 0.18em;
+                text-indent: 0.18em;
                 padding: 0 20px;
             }
             .footer {
-                font-size: 1.1rem;
+                font-size: 0.72rem;
+                letter-spacing: 0.16em;
                 bottom: 24px;
             }
         }
     </style>
 </head>
 <body>
+    <canvas id="bg"></canvas>
+    <script>
+        (function () {
+            var canvas = document.getElementById("bg");
+            var ctx = canvas.getContext("2d");
+            // Pixely look: render at a low internal resolution, CSS scales it up.
+            var PIXEL = 5;
+            var MAX_ITER = 88;
+            var LOG2 = Math.LN2;
+            // Throttle so the animation never starves the PoW workers.
+            var FPS = 6;
+            var frameInterval = 1000 / FPS;
+
+            var w = 1, h = 1, img = null, data = null, aspect = 1;
+
+            function resize() {
+                w = Math.max(1, Math.ceil(window.innerWidth / PIXEL));
+                h = Math.max(1, Math.ceil(window.innerHeight / PIXEL));
+                canvas.width = w;
+                canvas.height = h;
+                img = ctx.createImageData(w, h);
+                data = img.data;
+                aspect = w / h;
+            }
+
+            function render(t) {
+                // Animate the Julia constant, staying in the dendritic region
+                // (self-similar branching filaments = recognizably fractal).
+                var ang = t * 0.00009;
+                var cX = -0.77 + 0.035 * Math.cos(ang);
+                var cY = 0.135 + 0.035 * Math.sin(ang);
+                // Gentle breathing zoom + pan.
+                var zoom = 2.6 + 0.3 * Math.sin(t * 0.00006);
+                var panX = 0.18 * Math.sin(t * 0.00004);
+                var panY = 0.18 * Math.cos(t * 0.000035);
+
+                for (var py = 0; py < h; py++) {
+                    for (var px = 0; px < w; px++) {
+                        var zx = (px / w - 0.5) * zoom * aspect + panX;
+                        var zy = (py / h - 0.5) * zoom + panY;
+
+                        var x = zx, y = zy, i = 0, mag = 0;
+                        for (; i < MAX_ITER; i++) {
+                            var x2 = x * x - y * y + cX;
+                            y = 2 * x * y + cY;
+                            x = x2;
+                            mag = x * x + y * y;
+                            if (mag > 256) break;
+                        }
+
+                        var c;
+                        if (i >= MAX_ITER) {
+                            // Interior: very dark, faint inner glow keeps the body present.
+                            c = 0.04;
+                        } else {
+                            // Smooth (continuous) escape count -> clean fractal contours.
+                            var nu = i + 1 - Math.log(Math.log(mag) * 0.5) / LOG2;
+                            // Self-similar contour bands following the boundary filaments.
+                            var band = 0.5 + 0.5 * Math.sin(nu * 0.75 + t * 0.0004);
+                            var depth = nu / MAX_ITER;        // bright near the boundary
+                            c = Math.pow(band, 1.2) * Math.pow(depth, 0.4);
+                        }
+
+                        var g = Math.min(255, 22 + c * 110);
+                        var idx = (py * w + px) * 4;
+                        data[idx]     = g; // R
+                        data[idx + 1] = g; // G
+                        data[idx + 2] = g; // B
+                        data[idx + 3] = 255;
+                    }
+                }
+                ctx.putImageData(img, 0, 0);
+            }
+
+            var last = 0;
+            var reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+            function loop(t) {
+                if (t - last >= frameInterval) {
+                    last = t;
+                    render(t);
+                }
+                requestAnimationFrame(loop);
+            }
+
+            resize();
+            var resizeTimer;
+            window.addEventListener("resize", function () {
+                clearTimeout(resizeTimer);
+                resizeTimer = setTimeout(resize, 200);
+            });
+
+            if (reduce) {
+                render(0); // single static frame
+            } else {
+                requestAnimationFrame(loop);
+            }
+        })();
+    </script>
     <form id="challenge-form" method="POST" action="/challenge/verify" data-pow-salt="{{ pow_salt }}" data-pow-difficulty="{{ pow_difficulty }}">
         <div class="status">Checking your browser</div>
         <input type="hidden" name="original_url" value="{{ original_url }}">
