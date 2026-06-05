@@ -2,7 +2,7 @@
 
 A high-performance Rust reverse proxy designed to protect backend services from DDoS attacks. It features global rate limiting, connection limiting, Cloudflare Turnstile, and a native Proof-of-Work (PoW) captcha to mitigate automated attacks.
 
-This is a port of the original Go implementation (kept under `old/`) with identical behaviour and configuration.
+This is a Rust implementation of a DDoS protection proxy.
 
 ## Features
 

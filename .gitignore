@@ -7,9 +7,6 @@
 # Disk HTTP cache
 /cache_data
 
-# Go reference build artifacts (under old/)
-old/proxy
-old/cache_data/
 
 # Editor / IDE
 .idea/
