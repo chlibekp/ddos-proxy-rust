@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Rust reverse proxy with a WAF challenge layer for DDoS protection. It is a faithful port of the Go implementation kept under `old/` — when behaviour is ambiguous, `old/` is the reference of record. Same env-var config, same request lifecycle.
+Rust reverse proxy with a WAF challenge layer for DDoS protection.
 
 ## Commands
 
@@ -39,5 +39,4 @@ Request flow: `hyper server (main.rs) → route() → WAF Manager (waf) → Prox
 
 - The eBPF program lives at `src/bpf/xdp.c`; `build.rs` compiles it with clang at build time (feature `xdp`). Edit the C there — no checked-in `.o`. Maps must stay in BTF `.maps` style (legacy `bpf_map_def` won't load in aya).
 - Body types unify on `body::BoxedBody`; use `body::empty()` / `body::full()`.
-- Keep parity edits anchored to `old/` — diff the Go source when changing WAF/proxy logic.
 - Known intentional deviations (documented in README): `close` block action returns an empty `403 Connection: close` instead of a raw socket close; the first TLS handshake for a new host fails while the cert issues in the background.
