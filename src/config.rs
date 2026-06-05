@@ -35,6 +35,7 @@ pub struct Config {
     pub xdp_interface: String,
     pub pow_difficulty: usize,
     pub max_ip_states: i64,
+    pub cookie_challenge: bool,
 }
 
 /// Error returned when required configuration is missing.
@@ -151,6 +152,10 @@ impl Config {
 
         let xdp_interface = env::var("PROXY_XDP_INTERFACE").unwrap_or_default();
 
+        // Cookie challenge is the lightweight first tier; enabled by default.
+        // Disable explicitly with PROXY_COOKIE_CHALLENGE=false.
+        let cookie_challenge = !matches!(env::var("PROXY_COOKIE_CHALLENGE").as_deref(), Ok("false") | Ok("0"));
+
         let max_ip_states = env_nonempty("PROXY_MAX_IP_STATES")
             .and_then(|s| s.parse::<i64>().ok())
             .filter(|&v| v > 0)
@@ -187,6 +192,7 @@ impl Config {
             xdp_interface,
             pow_difficulty,
             max_ip_states,
+            cookie_challenge,
         })
     }
 }

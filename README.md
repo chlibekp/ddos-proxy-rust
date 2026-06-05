@@ -33,6 +33,7 @@ The proxy is configured via environment variables.
 | `PROXY_MITIGATION_TIME` | `5m` | Duration to keep mitigation active after thresholds are no longer exceeded (e.g. `5m`, `300s`). |
 | `PROXY_VERIFY_TIME` | `10m` | Duration for which a user remains verified after solving a challenge. |
 | `PROXY_ALWAYS_ON` | `false` | If `true`, the challenge is served for every request regardless of rate. |
+| `PROXY_COOKIE_CHALLENGE` | `true` | If `true`, mitigation first serves a lightweight cookie challenge (set cookie + 307 redirect) and only escalates to the JS/PoW challenge once a flood is detected bypassing it. Set `false` to always serve the JS challenge. |
 | `PROXY_USE_FORWARDED_FOR` | `false` | If `true`, the first `X-Forwarded-For` entry is used as the client IP. |
 | `PROXY_CLOUDFLARE_SUPPORT` | `false` | If `true`, the `CF-Connecting-IP` header is used as the client IP. |
 | `PROXY_TURNSTILE_PUBLIC_KEY` | `""` | Cloudflare Turnstile Site Key (optional; uses PoW if omitted). |
@@ -98,11 +99,13 @@ docker build --build-arg FEATURES=xdp -t ddos-proxy .
 2. **Normal Operation**: Other requests are proxied to `PROXY_BACKEND_URL`. The proxy tracks global request and connection rates.
 3. **Mitigation Trigger**: If rates exceed `PROXY_MAX_REQ` or `PROXY_MAX_CONN`, the proxy enters **Mitigation Mode**.
 4. **Disk Caching**: If enabled, GET requests may be served from disk; the `X-Ddos-Proxy-Cache` header indicates `HIT`/`MISS`/`DYNAMIC`.
-5. **Challenge**: In Mitigation Mode, unverified requests receive a lightweight HTML page (`HTTP 418`) running Turnstile (if keys set) or an invisible Proof-of-Work solver.
-6. **Verification**: The browser submits the solution to `POST /challenge/verify`. On success the IP is marked **verified** for `PROXY_VERIFY_TIME` and redirected to the original URL. PoW solutions submitted in under 2 seconds are rejected.
-7. **Bypass**: Verified IPs are proxied directly to the backend.
-8. **Blocking**: IPs that receive challenges but keep sending unsolved requests (more than `PROXY_MAX_FAILED_CHALLENGES`) are blocked. With `PROXY_XDP_INTERFACE` configured (and the `xdp` feature), packets are additionally dropped at Layer 4.
-9. **Recovery**: Mitigation Mode turns off after `PROXY_MITIGATION_TIME` without rate violations (unless `PROXY_ALWAYS_ON`).
+5. **Cookie Challenge (tier 1)**: In Mitigation Mode, with `PROXY_COOKIE_CHALLENGE` enabled (the default), unverified requests first get a lightweight cookie challenge — a token cookie is set and the client is bounced back to the original URL with an `HTTP 307` redirect. Real browsers replay the request with the cookie and are let through; trivial floods that ignore `Set-Cookie`/redirects are dropped here cheaply.
+6. **Escalation to JS Challenge (tier 2)**: If the flood keeps breaching the rate thresholds *while* the cookie challenge is active, the attack is solving the cookie challenge, so the proxy escalates every client to the heavier challenge below for `PROXY_MITIGATION_TIME`.
+7. **Challenge**: When escalated (or with `PROXY_COOKIE_CHALLENGE=false`), unverified requests receive a lightweight HTML page (`HTTP 418`) running Turnstile (if keys set) or an invisible Proof-of-Work solver.
+8. **Verification**: The browser submits the solution to `POST /challenge/verify`. On success the IP is marked **verified** for `PROXY_VERIFY_TIME` and redirected to the original URL. PoW solutions submitted in under 2 seconds are rejected.
+9. **Bypass**: Verified IPs are proxied directly to the backend.
+10. **Blocking**: IPs that receive challenges but keep sending unsolved requests (more than `PROXY_MAX_FAILED_CHALLENGES`) are blocked. With `PROXY_XDP_INTERFACE` configured (and the `xdp` feature), packets are additionally dropped at Layer 4.
+11. **Recovery**: Mitigation Mode turns off after `PROXY_MITIGATION_TIME` without rate violations (unless `PROXY_ALWAYS_ON`).
 
 ## Notes on parity with the Go version
 
