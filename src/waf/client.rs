@@ -25,6 +25,8 @@ pub struct Inner {
     pub pow_salt: String,
     pub error_count: i64,
     pub l4_blocked: bool,
+    /// Token expected back in the cookie-challenge cookie for this client.
+    pub cookie_token: String,
 }
 
 impl Default for ClientState {

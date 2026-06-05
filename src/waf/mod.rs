@@ -30,6 +30,7 @@ pub struct Manager {
     xdp: Option<Arc<dyn Blocker>>,
     proxy: Arc<Proxy>,
     mitigation_until: AtomicI64, // unix seconds
+    js_challenge_until: AtomicI64, // unix seconds; while set, escalate cookie→JS challenge
     timeout_count: AtomicI64,
     ip_states: DashMap<String, Arc<ClientState>>,
     ip_state_count: AtomicI64,
@@ -54,6 +55,7 @@ impl Manager {
             xdp,
             proxy,
             mitigation_until: AtomicI64::new(0),
+            js_challenge_until: AtomicI64::new(0),
             timeout_count: AtomicI64::new(0),
             ip_states: DashMap::new(),
             ip_state_count: AtomicI64::new(0),
@@ -262,6 +264,67 @@ impl Manager {
         resp
     }
 
+    /// Check whether the request carries a valid cookie-challenge cookie matching
+    /// the token we issued to this client.
+    fn cookie_valid<B>(&self, req: &Request<B>, state: &Arc<ClientState>) -> bool {
+        let token = {
+            let inner = state.inner.lock().unwrap();
+            inner.cookie_token.clone()
+        };
+        if token.is_empty() {
+            return false;
+        }
+        for hv in req.headers().get_all(http::header::COOKIE) {
+            if let Ok(s) = hv.to_str() {
+                for pair in s.split(';') {
+                    let pair = pair.trim();
+                    if let Some(val) = pair.strip_prefix(&format!("{COOKIE_NAME}=")) {
+                        if val == token {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Serve the lightweight cookie challenge: issue a token cookie and bounce the
+    /// client back to the original URL with a 307 redirect. Browsers replay the
+    /// request with the cookie set; trivial floods that ignore Set-Cookie/redirects
+    /// are filtered out here without the cost of the JS challenge.
+    fn serve_cookie_challenge(&self, state: &Arc<ClientState>, original_url: &str) -> Response<BoxedBody> {
+        let token = {
+            let mut inner = state.inner.lock().unwrap();
+            if inner.cookie_token.is_empty() {
+                inner.cookie_token = random_hex_16();
+            }
+            inner.cookie_token.clone()
+        };
+
+        let max_age = self.cfg.verify_time.as_secs().max(1);
+        let cookie = format!(
+            "{COOKIE_NAME}={token}; Path=/; Max-Age={max_age}; HttpOnly; SameSite=Lax"
+        );
+
+        let mut resp = Response::new(empty());
+        *resp.status_mut() = StatusCode::TEMPORARY_REDIRECT;
+        let h = resp.headers_mut();
+        if let Ok(hv) = HeaderValue::from_str(&cookie) {
+            h.insert(http::header::SET_COOKIE, hv);
+        }
+        let loc = if original_url.is_empty() { "/" } else { original_url };
+        if let Ok(hv) = HeaderValue::from_str(loc) {
+            h.insert(http::header::LOCATION, hv);
+        }
+        h.insert(HeaderName::from_static("x-mitigation"), HeaderValue::from_static("cookie"));
+        h.insert(
+            http::header::CACHE_CONTROL,
+            HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+        );
+        resp
+    }
+
     /// Main WAF entry point.
     pub async fn handle(self: &Arc<Self>, req: Request<Incoming>, ctx: ReqCtx) -> Response<BoxedBody> {
         if is_websocket_upgrade(&req) {
@@ -393,6 +456,14 @@ impl Manager {
         let mut should_serve_challenge = self.cfg.always_on;
 
         if req_rate >= self.cfg.max_req_per_sec || conn_rate >= self.cfg.max_conn_per_sec {
+            // If we were already in a mitigation window, the rate is still being
+            // breached despite the cookie challenge being served — i.e. the attack
+            // is solving the cookie challenge and bypassing it. Escalate every
+            // client to the heavier JS (PoW/Turnstile) challenge.
+            if self.cfg.cookie_challenge && now_s < mitigation_until {
+                self.js_challenge_until
+                    .store(now_s + mitigation_secs, Ordering::SeqCst);
+            }
             self.mitigation_until
                 .store(now_s + mitigation_secs, Ordering::SeqCst);
             should_serve_challenge = true;
@@ -407,6 +478,28 @@ impl Manager {
         }
 
         if should_serve_challenge {
+            // Tier 1: cookie challenge. Only fall through to the heavier JS
+            // challenge once we've detected the cookie challenge is being bypassed
+            // (js_challenge_until in the future) or it's disabled entirely.
+            let js_mode = !self.cfg.cookie_challenge
+                || now_s < self.js_challenge_until.load(Ordering::SeqCst);
+
+            if !js_mode {
+                if self.cookie_valid(&req, &state) {
+                    // Passed the cookie challenge. Allow through, but still count
+                    // the request so a bypassing flood remains detectable.
+                    self.rl.inc_req();
+                    if self.prom() {
+                        metrics::allowed("cookie");
+                    }
+                    return self.proxy.handle(req, &ctx).await;
+                }
+                if self.prom() {
+                    metrics::challenged();
+                }
+                return self.serve_cookie_challenge(&state, &original_url);
+            }
+
             let mut inner = state.inner.lock().unwrap();
             if !inner.challenge_served {
                 inner.challenge_served = true;
@@ -607,6 +700,9 @@ impl Manager {
         }
     }
 }
+
+/// Name of the cookie issued by the tier-1 cookie challenge.
+const COOKIE_NAME: &str = "__ddos_clearance";
 
 fn strip_port(addr: &str) -> String {
     // Strip a trailing ":port" if present (handles host:port and ip:port).
