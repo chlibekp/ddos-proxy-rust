@@ -126,16 +126,25 @@ impl Proxy {
         };
 
         // Send to backend.
+        let req_start = std::time::Instant::now();
         let upstream = match self.client.request(outbound).await {
             Ok(r) => r,
             Err(e) => {
                 tracing::error!(error = %e, "Proxy error");
+                if self.cfg.prometheus_enabled {
+                    crate::metrics::backend_response("error");
+                    crate::metrics::backend_duration(req_start.elapsed().as_secs_f64());
+                }
                 return error_response(StatusCode::BAD_GATEWAY, "Bad Gateway");
             }
         };
 
         // Convert to buffered form when we may store or inject; otherwise stream.
         let status = upstream.status();
+        if self.cfg.prometheus_enabled {
+            crate::metrics::backend_response(crate::metrics::status_class(status.as_u16()));
+            crate::metrics::backend_duration(req_start.elapsed().as_secs_f64());
+        }
         let (parts, body) = upstream.into_parts();
         let content_type = parts
             .headers

@@ -216,6 +216,10 @@ impl Manager {
         for ip in to_unblock {
             self.unblock_l4(&ip);
         }
+
+        if self.prom() {
+            metrics::set_ip_states(self.ip_state_count.load(Ordering::SeqCst));
+        }
     }
 
     fn render_challenge(&self, err: &str, site_key: &str, original_url: &str, salt: &str) -> String {
