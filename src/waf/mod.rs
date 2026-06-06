@@ -293,7 +293,7 @@ impl Manager {
     /// client back to the original URL with a 307 redirect. Browsers replay the
     /// request with the cookie set; trivial floods that ignore Set-Cookie/redirects
     /// are filtered out here without the cost of the JS challenge.
-    fn serve_cookie_challenge(&self, state: &Arc<ClientState>, original_url: &str) -> Response<BoxedBody> {
+    fn serve_cookie_challenge(&self, state: &Arc<ClientState>, original_url: &str, is_tls: bool) -> Response<BoxedBody> {
         let token = {
             let mut inner = state.inner.lock().unwrap();
             if inner.cookie_token.is_empty() {
@@ -303,8 +303,12 @@ impl Manager {
         };
 
         let max_age = self.cfg.verify_time.as_secs().max(1);
+        // SameSite=None; Secure is required for cross-site contexts (e.g. subrequests,
+        // iframes) — SameSite=Lax is blocked by browsers in those cases. SameSite=None
+        // requires the Secure attribute, so fall back to no SameSite on plain HTTP.
+        let samesite = if is_tls { "; SameSite=None; Secure" } else { "" };
         let cookie = format!(
-            "{COOKIE_NAME}={token}; Path=/; Max-Age={max_age}; HttpOnly; SameSite=Lax"
+            "{COOKIE_NAME}={token}; Path=/; Max-Age={max_age}; HttpOnly{samesite}"
         );
 
         let mut resp = Response::new(empty());
@@ -497,7 +501,7 @@ impl Manager {
                 if self.prom() {
                     metrics::challenged();
                 }
-                return self.serve_cookie_challenge(&state, &original_url);
+                return self.serve_cookie_challenge(&state, &original_url, ctx.is_tls);
             }
 
             let mut inner = state.inner.lock().unwrap();
