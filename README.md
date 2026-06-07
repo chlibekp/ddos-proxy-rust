@@ -29,6 +29,7 @@ The proxy is configured via environment variables.
 | `PORT` | `8080` | The port the proxy listens on. |
 | `PROXY_MAX_REQ` | `300` | Max global requests per second before triggering mitigation. |
 | `PROXY_MAX_CONN` | `50` | Max global new connections per second before triggering mitigation. |
+| `PROXY_MAX_REQ_PER_IP` | `0` (off) | Max requests per second from a single IP before that IP is served the WAF challenge. Unlike `PROXY_MAX_REQ`, exceeding this limit only challenges the offending IP and does not trigger a global mitigation window for all clients. Blocked and verified IPs are exempt. Set to `0` or omit to disable. |
 | `PROXY_POW_DIFFICULTY` | `5` | Difficulty (number of leading zero hex chars) for the native Proof-of-Work challenge. |
 | `PROXY_MITIGATION_TIME` | `5m` | Duration to keep mitigation active after thresholds are no longer exceeded (e.g. `5m`, `300s`). |
 | `PROXY_VERIFY_TIME` | `10m` | Duration for which a user remains verified after solving a challenge. |
