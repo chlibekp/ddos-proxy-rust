@@ -24,7 +24,7 @@ pub async fn handle(req: Request<Incoming>, ctx: ReqCtx, manager: Arc<Manager>) 
     // Dashboard page — served without a server-side auth check so the browser
     // can load it; the JS layer handles login and stores the token in sessionStorage.
     // Only served when the admin API is actually enabled.
-    if method == "GET" && (path == "/admin" || path == "/admin/") {
+    if method == "GET" && (path == "/ddos-proxy/admin" || path == "/ddos-proxy/admin/") {
         if manager.config().admin_secret.is_some() {
             let mut resp = Response::new(full(DASHBOARD_HTML));
             resp.headers_mut().insert(
@@ -58,15 +58,15 @@ pub async fn handle(req: Request<Incoming>, ctx: ReqCtx, manager: Arc<Manager>) 
 
     match (method.as_str(), path.as_str()) {
         // List all tracked IP states.
-        ("GET", "/admin/states") => {
+        ("GET", "/ddos-proxy/admin/states") => {
             let states = manager.list_states();
             let body = serde_json::to_string(&states).unwrap_or_else(|_| "[]".to_string());
             json(StatusCode::OK, &body)
         }
 
         // Fetch a single state by its `ip|host` key (URL-encoded in the path).
-        ("GET", p) if p.starts_with("/admin/states/") => {
-            let raw = &p["/admin/states/".len()..];
+        ("GET", p) if p.starts_with("/ddos-proxy/admin/states/") => {
+            let raw = &p["/ddos-proxy/admin/states/".len()..];
             let key = percent_decode(raw);
             match manager.get_state_by_key(&key) {
                 Some(s) => {
@@ -78,14 +78,14 @@ pub async fn handle(req: Request<Incoming>, ctx: ReqCtx, manager: Arc<Manager>) 
         }
 
         // Current mitigation status (active flag, timestamps, IP state count).
-        ("GET", "/admin/status") => {
+        ("GET", "/ddos-proxy/admin/status") => {
             let status = manager.get_status();
             let body = serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string());
             json(StatusCode::OK, &body)
         }
 
         // Manually block an IP+host pair.
-        ("POST", "/admin/block") => match read_block_req(req).await {
+        ("POST", "/ddos-proxy/admin/block") => match read_block_req(req).await {
             Some((ip, host)) => {
                 manager.manual_block(&ip, &host);
                 json(StatusCode::OK, r#"{"ok":true}"#)
@@ -97,7 +97,7 @@ pub async fn handle(req: Request<Incoming>, ctx: ReqCtx, manager: Arc<Manager>) 
         },
 
         // Manually unblock an IP+host pair.
-        ("DELETE", "/admin/block") => match read_block_req(req).await {
+        ("DELETE", "/ddos-proxy/admin/block") => match read_block_req(req).await {
             Some((ip, host)) => {
                 manager.manual_unblock(&ip, &host);
                 json(StatusCode::OK, r#"{"ok":true}"#)
@@ -286,7 +286,7 @@ function api(path, opts = {}) {
 
 async function doLogin() {
   token = document.getElementById('token-input').value.trim();
-  const r = await api('/admin/status').catch(() => null);
+  const r = await api('/ddos-proxy/admin/status').catch(() => null);
   if (!r || r.status === 401) {
     document.getElementById('login-err').textContent = 'Invalid token';
     return;
@@ -327,7 +327,7 @@ function statusBadge(state) {
 
 async function refresh() {
   const [statusResp, statesResp] = await Promise.all([
-    api('/admin/status'), api('/admin/states')
+    api('/ddos-proxy/admin/status'), api('/ddos-proxy/admin/states')
   ]);
   if (statusResp.status === 401) { doLogout(); return; }
 
@@ -370,21 +370,21 @@ async function blockIP() {
   const ip = document.getElementById('f-ip').value.trim();
   const host = document.getElementById('f-host').value.trim();
   if (!ip || !host) { toast('Enter both IP and host', false); return; }
-  const r = await api('/admin/block', { method: 'POST', body: JSON.stringify({ ip, host }) });
+  const r = await api('/ddos-proxy/admin/block', { method: 'POST', body: JSON.stringify({ ip, host }) });
   if (r.ok) { toast('Blocked ' + ip); refresh(); document.getElementById('f-ip').value = ''; document.getElementById('f-host').value = ''; }
   else toast('Error blocking', false);
 }
 
 async function blockKey(key) {
   const [ip, host] = key.split('|');
-  const r = await api('/admin/block', { method: 'POST', body: JSON.stringify({ ip, host }) });
+  const r = await api('/ddos-proxy/admin/block', { method: 'POST', body: JSON.stringify({ ip, host }) });
   if (r.ok) { toast('Blocked ' + key); refresh(); }
   else toast('Error', false);
 }
 
 async function unblockKey(key) {
   const [ip, host] = key.split('|');
-  const r = await api('/admin/block', { method: 'DELETE', body: JSON.stringify({ ip, host }) });
+  const r = await api('/ddos-proxy/admin/block', { method: 'DELETE', body: JSON.stringify({ ip, host }) });
   if (r.ok) { toast('Unblocked ' + key); refresh(); }
   else toast('Error', false);
 }
@@ -399,7 +399,7 @@ document.getElementById('token-input').addEventListener('keydown', e => {
 
 // Auto-login if token already in sessionStorage.
 if (token) {
-  api('/admin/status').then(r => {
+  api('/ddos-proxy/admin/status').then(r => {
     if (r && r.ok) {
       document.getElementById('login').style.display = 'none';
       document.getElementById('app').style.display = 'block';

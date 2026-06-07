@@ -208,7 +208,7 @@ pub async fn route(
         return Ok(metrics_endpoint(&ctx, ip_limiter.as_deref()));
     }
     let path = req.uri().path();
-    if path.starts_with("/admin/") || path == "/admin" {
+    if path.starts_with("/ddos-proxy/admin") {
         return Ok(admin::handle(req, ctx, manager).await);
     }
     Ok(manager.handle(req, ctx).await)
