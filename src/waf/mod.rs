@@ -534,7 +534,10 @@ impl Manager {
             // Tier 1: cookie challenge. Only fall through to the heavier JS
             // challenge once we've detected the cookie challenge is being bypassed
             // (js_challenge_until in the future) or it's disabled entirely.
-            let js_mode = !self.cfg.cookie_challenge
+            // Per-IP rate-limited requests skip tier-1 entirely: a fast single IP
+            // can trivially solve a cookie redirect, so we go straight to JS/PoW.
+            let js_mode = per_ip_over_limit
+                || !self.cfg.cookie_challenge
                 || now_s < self.js_challenge_until.load(Ordering::SeqCst);
 
             if !js_mode {
