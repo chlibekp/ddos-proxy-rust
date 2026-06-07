@@ -170,6 +170,8 @@ impl Manager {
 
         let mut to_delete: Vec<String> = Vec::new();
         let mut to_unblock: Vec<String> = Vec::new();
+        // Count challenges that were issued but never solved before eviction.
+        let mut abandoned: u64 = 0;
 
         for entry in self.ip_states.iter() {
             let key = entry.key().clone();
@@ -183,6 +185,9 @@ impl Manager {
             }
 
             if attack_ended && !self.cfg.always_on && !inner.verified {
+                if inner.challenge_served {
+                    abandoned += 1;
+                }
                 to_delete.push(key);
                 continue;
             }
@@ -204,6 +209,9 @@ impl Manager {
 
             // Evict idle unverified entries.
             if !inner.verified && now_s - state.last_seen.load(Ordering::SeqCst) > 10 * 60 {
+                if inner.challenge_served {
+                    abandoned += 1;
+                }
                 to_delete.push(key.clone());
             }
         }
@@ -219,6 +227,9 @@ impl Manager {
 
         if self.prom() {
             metrics::set_ip_states(self.ip_state_count.load(Ordering::SeqCst));
+            if abandoned > 0 {
+                metrics::challenge_abandoned(abandoned);
+            }
         }
     }
 
@@ -643,21 +654,35 @@ impl Manager {
         // Mark IP as verified.
         if let Some(state) = self.get_client_state(&ip, &host) {
             let now_ms = now_millis();
-            {
+            // Capture the timestamp before clearing it so we can record solve latency.
+            let challenge_issued_ms = {
                 let mut inner = state.inner.lock().unwrap();
+                let issued = inner.challenge_served_at_ms;
                 inner.violation_count = 0;
                 inner.challenge_served = false;
                 inner.blocked = false;
                 inner.verified = true;
                 inner.verified_at_ms = now_ms;
                 inner.pow_salt = String::new();
-            }
+                issued
+            };
             state.blocked_flag.store(false, Ordering::SeqCst);
             state.verified_flag.store(true, Ordering::SeqCst);
             state.verified_until.store(
                 now_unix() + self.cfg.verify_time.as_secs() as i64,
                 Ordering::SeqCst,
             );
+
+            // Record how long the client took to solve the challenge.
+            if self.prom() && challenge_issued_ms > 0 {
+                let challenge_type = if self.cfg.turnstile_site_key.is_empty() {
+                    "pow"
+                } else {
+                    "turnstile"
+                };
+                let elapsed_secs = (now_ms - challenge_issued_ms).max(0) as f64 / 1000.0;
+                metrics::challenge_solved(challenge_type, elapsed_secs);
+            }
         }
 
         let original_url = {
