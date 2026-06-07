@@ -34,6 +34,13 @@ const HOP_BY_HOP: &[&str] = &[
     "upgrade",
 ];
 
+const SERVER_BANNER: &str = concat!("ddos-proxy/", env!("CARGO_PKG_VERSION"));
+const VIA_BANNER: &str = concat!(
+    "ddos-proxy/",
+    env!("CARGO_PKG_VERSION"),
+    " https://github.com/chlibekp/ddos-proxy-rust"
+);
+
 type ProxyClient = Client<HttpsConnector<HttpConnector>, BoxedBody>;
 
 /// Per-request context that the WAF/server thread provides.
@@ -377,9 +384,9 @@ impl Proxy {
     }
 
     fn apply_common_headers(&self, headers: &mut HeaderMap, cache_status: CacheStatus) {
-        headers.insert(HeaderName::from_static("via"), HeaderValue::from_static("ddos-proxy"));
+        headers.insert(HeaderName::from_static("via"), HeaderValue::from_static(VIA_BANNER));
         headers.remove(http::header::SERVER);
-        headers.insert(http::header::SERVER, HeaderValue::from_static("ddos-proxy"));
+        headers.insert(http::header::SERVER, HeaderValue::from_static(SERVER_BANNER));
 
         let value = match cache_status {
             CacheStatus::Hit => {
