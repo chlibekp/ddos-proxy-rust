@@ -206,11 +206,8 @@ impl Config {
             pow_difficulty,
             max_ip_states,
             cookie_challenge,
-<<<<<<< HEAD
             max_req_per_ip,
-=======
             admin_secret,
->>>>>>> 1e70cdd (feat: add admin API for real-time IP state inspection and manual control)
         })
     }
 }

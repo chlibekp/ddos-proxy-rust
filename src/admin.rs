@@ -460,6 +460,7 @@ mod tests {
             pow_difficulty: 5,
             max_ip_states: 500_000,
             cookie_challenge: true,
+            max_req_per_ip: None,
             admin_secret: secret.map(|s| s.to_string()),
         });
         let rl = Arc::new(RateLimiter::new());
