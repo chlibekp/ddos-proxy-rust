@@ -6,11 +6,15 @@ use std::sync::Mutex;
 /// The atomic fields form the lock-free fast path (read on every request); they
 /// are always kept in sync with the mutex-protected canonical fields below.
 pub struct ClientState {
-    pub last_seen: AtomicI64,      // unix seconds
+    pub last_seen: AtomicI64,       // unix seconds
     pub blocked_flag: AtomicBool,
     pub verified_flag: AtomicBool,
-    pub verified_until: AtomicI64, // unix seconds when verification expires
+    pub verified_until: AtomicI64,  // unix seconds when verification expires
     pub inner: Mutex<Inner>,
+    /// Per-IP rate-limit window: the unix second in which ip_req_count started.
+    pub ip_req_window: AtomicI64,
+    /// Requests counted in the current ip_req_window second.
+    pub ip_req_count: AtomicI64,
 }
 
 #[derive(Default)]
@@ -37,6 +41,8 @@ impl Default for ClientState {
             verified_flag: AtomicBool::new(false),
             verified_until: AtomicI64::new(0),
             inner: Mutex::new(Inner::default()),
+            ip_req_window: AtomicI64::new(0),
+            ip_req_count: AtomicI64::new(0),
         }
     }
 }

@@ -233,6 +233,28 @@ impl Manager {
         }
     }
 
+    /// Count this request toward the per-IP rate window and return `true` if the
+    /// configured limit is exceeded for the current second.
+    ///
+    /// Uses Relaxed ordering throughout — minor inaccuracies at second boundaries
+    /// are acceptable for rate limiting.
+    fn check_per_ip_rate(&self, state: &Arc<ClientState>, now_s: i64) -> bool {
+        let Some(max) = self.cfg.max_req_per_ip else {
+            return false;
+        };
+        let window = state.ip_req_window.load(Ordering::Relaxed);
+        let count = if now_s > window {
+            // New second: reset the window. Concurrent resets (race) are harmless —
+            // at worst we lose one or two counts at the boundary, which is fine.
+            state.ip_req_window.store(now_s, Ordering::Relaxed);
+            state.ip_req_count.store(1, Ordering::Relaxed);
+            1
+        } else {
+            state.ip_req_count.fetch_add(1, Ordering::Relaxed) + 1
+        };
+        count > max
+    }
+
     fn render_challenge(&self, err: &str, site_key: &str, original_url: &str, salt: &str) -> String {
         let tmpl = self.env.get_template("challenge.html").unwrap();
         tmpl.render(context! {
@@ -468,11 +490,23 @@ impl Manager {
             return self.verify_challenge(req, &ctx).await;
         }
 
+        // Per-IP rate limit: if this IP exceeds PROXY_MAX_REQ_PER_IP req/s,
+        // challenge it directly without touching the global mitigation window.
+        // This lets the proxy stay open for all other clients while the single
+        // fast IP is challenged.
+        let per_ip_over_limit = self.check_per_ip_rate(&state, now_s);
+        if per_ip_over_limit {
+            tracing::debug!(ip = %ip, "per-IP rate limit exceeded; serving challenge");
+            if self.prom() {
+                metrics::per_ip_rate_limited();
+            }
+        }
+
         // Global rate-limit / mitigation evaluation.
         let (req_rate, conn_rate) = self.rl.get_counts();
         let mitigation_until = self.mitigation_until.load(Ordering::SeqCst);
         let mitigation_secs = self.cfg.mitigation_time.as_secs() as i64;
-        let mut should_serve_challenge = self.cfg.always_on;
+        let mut should_serve_challenge = self.cfg.always_on || per_ip_over_limit;
 
         if req_rate >= self.cfg.max_req_per_sec || conn_rate >= self.cfg.max_conn_per_sec {
             // If we were already in a mitigation window, the rate is still being
