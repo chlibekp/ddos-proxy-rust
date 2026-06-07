@@ -1,3 +1,4 @@
+mod admin;
 mod body;
 mod cache;
 mod config;
@@ -195,7 +196,7 @@ async fn serve_plain(
     tracing::info!("Server exited properly");
 }
 
-/// Route a request: `/metrics` (when enabled) bypasses the WAF; everything else
+/// Route a request: `/metrics` and `/admin/` bypass the WAF; everything else
 /// goes through the WAF middleware.
 pub async fn route(
     req: Request<Incoming>,
@@ -205,6 +206,10 @@ pub async fn route(
 ) -> Result<Response<BoxedBody>, Infallible> {
     if manager.config().prometheus_enabled && req.uri().path() == "/metrics" {
         return Ok(metrics_endpoint(&ctx, ip_limiter.as_deref()));
+    }
+    let path = req.uri().path();
+    if path.starts_with("/ddos-proxy/admin") {
+        return Ok(admin::handle(req, ctx, manager).await);
     }
     Ok(manager.handle(req, ctx).await)
 }

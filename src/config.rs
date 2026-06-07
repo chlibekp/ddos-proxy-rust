@@ -40,6 +40,8 @@ pub struct Config {
     /// When an unverified IP exceeds this limit it is served the WAF challenge
     /// instead of being proxied, without triggering a global mitigation window.
     pub max_req_per_ip: Option<i64>,
+    /// Bearer token that protects the `/ddos-proxy/admin/` endpoints. `None` disables the admin API.
+    pub admin_secret: Option<String>,
 }
 
 /// Error returned when required configuration is missing.
@@ -170,6 +172,8 @@ impl Config {
             .filter(|&v| v > 0)
             .unwrap_or(500_000);
 
+        let admin_secret = env_nonempty("PROXY_ADMIN_SECRET");
+
         Ok(Config {
             backend_url,
             port,
@@ -203,6 +207,7 @@ impl Config {
             max_ip_states,
             cookie_challenge,
             max_req_per_ip,
+            admin_secret,
         })
     }
 }

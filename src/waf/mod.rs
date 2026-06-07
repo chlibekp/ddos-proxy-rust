@@ -771,6 +771,129 @@ impl Manager {
     }
 }
 
+// ── Admin API types and methods ──────────────────────────────────────────────
+
+/// Snapshot of a single tracked IP|Host state, returned by the admin API.
+#[derive(serde::Serialize)]
+pub struct StateInfo {
+    pub key: String,
+    pub blocked: bool,
+    pub verified: bool,
+    pub verified_until_unix: i64,
+    pub last_seen_unix: i64,
+    pub violation_count: i64,
+    pub challenge_served: bool,
+    pub l4_blocked: bool,
+    pub error_count: i64,
+}
+
+/// Current mitigation / rate-limiting status, returned by GET /admin/status.
+#[derive(serde::Serialize)]
+pub struct MitigationStatus {
+    pub mitigation_active: bool,
+    pub mitigation_until_unix: i64,
+    pub js_challenge_active: bool,
+    pub js_challenge_until_unix: i64,
+    pub ip_state_count: i64,
+}
+
+impl Manager {
+    /// Return a snapshot of every tracked IP|Host state.
+    pub fn list_states(&self) -> Vec<StateInfo> {
+        self.ip_states
+            .iter()
+            .map(|entry| {
+                let key = entry.key().clone();
+                let state = entry.value();
+                let inner = state.inner.lock().unwrap();
+                StateInfo {
+                    key,
+                    blocked: inner.blocked,
+                    verified: inner.verified,
+                    verified_until_unix: state.verified_until.load(Ordering::SeqCst),
+                    last_seen_unix: state.last_seen.load(Ordering::SeqCst),
+                    violation_count: inner.violation_count,
+                    challenge_served: inner.challenge_served,
+                    l4_blocked: inner.l4_blocked,
+                    error_count: inner.error_count,
+                }
+            })
+            .collect()
+    }
+
+    /// Look up a single state by its canonical `ip|host` key.
+    pub fn get_state_by_key(&self, key: &str) -> Option<StateInfo> {
+        let entry = self.ip_states.get(key)?;
+        let state = entry.value();
+        let inner = state.inner.lock().unwrap();
+        Some(StateInfo {
+            key: key.to_string(),
+            blocked: inner.blocked,
+            verified: inner.verified,
+            verified_until_unix: state.verified_until.load(Ordering::SeqCst),
+            last_seen_unix: state.last_seen.load(Ordering::SeqCst),
+            violation_count: inner.violation_count,
+            challenge_served: inner.challenge_served,
+            l4_blocked: inner.l4_blocked,
+            error_count: inner.error_count,
+        })
+    }
+
+    /// Snapshot of current mitigation state and tracked IP count.
+    pub fn get_status(&self) -> MitigationStatus {
+        let now_s = now_unix();
+        let mitigation_until = self.mitigation_until.load(Ordering::SeqCst);
+        let js_challenge_until = self.js_challenge_until.load(Ordering::SeqCst);
+        MitigationStatus {
+            mitigation_active: now_s < mitigation_until,
+            mitigation_until_unix: mitigation_until,
+            js_challenge_active: now_s < js_challenge_until,
+            js_challenge_until_unix: js_challenge_until,
+            ip_state_count: self.ip_state_count.load(Ordering::SeqCst),
+        }
+    }
+
+    /// Administratively block an IP+host. Creates the client state if needed.
+    pub fn manual_block(&self, ip: &str, host: &str) {
+        let state = match self.get_client_state(ip, host) {
+            Some(s) => s,
+            None => return,
+        };
+        let now_ms = crate::util::now_millis();
+        let mut inner = state.inner.lock().unwrap();
+        inner.blocked = true;
+        inner.blocked_at_ms = now_ms;
+        drop(inner);
+        state.blocked_flag.store(true, Ordering::SeqCst);
+        tracing::info!(ip = ip, host = host, "Admin: manually blocked IP");
+    }
+
+    /// Administratively unblock an IP+host, clearing violation counts.
+    /// Also removes the XDP L4 block if one was active.
+    pub fn manual_unblock(&self, ip: &str, host: &str) {
+        let h = strip_port(host);
+        let key = format!("{ip}|{h}");
+        let needs_l4_unblock = if let Some(entry) = self.ip_states.get(&key) {
+            let state = entry.value();
+            let mut inner = state.inner.lock().unwrap();
+            let was_l4 = inner.l4_blocked;
+            inner.blocked = false;
+            inner.blocked_at_ms = 0;
+            inner.violation_count = 0;
+            inner.l4_blocked = false;
+            drop(inner);
+            state.blocked_flag.store(false, Ordering::SeqCst);
+            was_l4
+        } else {
+            false
+        };
+        if needs_l4_unblock {
+            self.unblock_l4(ip);
+        }
+        tracing::info!(ip = ip, host = host, "Admin: manually unblocked IP");
+    }
+}
+
 /// Name of the cookie issued by the tier-1 cookie challenge.
 const COOKIE_NAME: &str = "__ddos_clearance";
 
