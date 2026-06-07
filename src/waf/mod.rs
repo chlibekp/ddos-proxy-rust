@@ -542,8 +542,20 @@ impl Manager {
 
             if !js_mode {
                 if self.cookie_valid(&req, &state) {
-                    // Passed the cookie challenge. Allow through, but still count
-                    // the request so a bypassing flood remains detectable.
+                    // Passed the cookie challenge — promote this IP to the verified
+                    // allow-list so subsequent requests skip cookie re-checking entirely.
+                    {
+                        let mut inner = state.inner.lock().unwrap();
+                        inner.verified = true;
+                        inner.verified_at_ms = now_ms;
+                        inner.violation_count = 0;
+                        inner.challenge_served = false;
+                    }
+                    state.verified_flag.store(true, Ordering::SeqCst);
+                    state.verified_until.store(
+                        now_s + self.cfg.verify_time.as_secs() as i64,
+                        Ordering::SeqCst,
+                    );
                     self.rl.inc_req();
                     if self.prom() {
                         metrics::allowed("cookie");
