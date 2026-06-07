@@ -36,6 +36,10 @@ pub struct Config {
     pub pow_difficulty: usize,
     pub max_ip_states: i64,
     pub cookie_challenge: bool,
+    /// Optional per-IP request rate cap (req/s). `None` means disabled.
+    /// When an unverified IP exceeds this limit it is served the WAF challenge
+    /// instead of being proxied, without triggering a global mitigation window.
+    pub max_req_per_ip: Option<i64>,
 }
 
 /// Error returned when required configuration is missing.
@@ -156,6 +160,11 @@ impl Config {
         // Disable explicitly with PROXY_COOKIE_CHALLENGE=false.
         let cookie_challenge = !matches!(env::var("PROXY_COOKIE_CHALLENGE").as_deref(), Ok("false") | Ok("0"));
 
+        // Per-IP rate cap: 0 or absent disables the feature.
+        let max_req_per_ip = env_nonempty("PROXY_MAX_REQ_PER_IP")
+            .and_then(|s| s.parse::<i64>().ok())
+            .filter(|&v| v > 0);
+
         let max_ip_states = env_nonempty("PROXY_MAX_IP_STATES")
             .and_then(|s| s.parse::<i64>().ok())
             .filter(|&v| v > 0)
@@ -193,6 +202,7 @@ impl Config {
             pow_difficulty,
             max_ip_states,
             cookie_challenge,
+            max_req_per_ip,
         })
     }
 }

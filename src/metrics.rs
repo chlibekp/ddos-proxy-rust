@@ -111,6 +111,18 @@ pub static CHALLENGE_ABANDONED: Lazy<IntCounter> = Lazy::new(|| {
     c
 });
 
+/// Requests that triggered the per-IP rate limit and were served a WAF challenge.
+/// Only incremented when PROXY_MAX_REQ_PER_IP is configured.
+pub static PER_IP_RATE_LIMITED: Lazy<IntCounter> = Lazy::new(|| {
+    let c = IntCounter::new(
+        "ddos_proxy_per_ip_rate_limited_total",
+        "Requests served a WAF challenge because their source IP exceeded PROXY_MAX_REQ_PER_IP",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).unwrap();
+    c
+});
+
 /// Current number of tracked per-IP client states. Updated every 10 s by the cleanup ticker.
 pub static IP_STATES: Lazy<IntGauge> = Lazy::new(|| {
     let g = IntGauge::new(
@@ -145,6 +157,7 @@ pub fn init() {
     // Force Lazy initialisation so histograms, vecs, and gauge appear on the first scrape.
     let _ = &*BACKEND_REQUEST_DURATION;
     let _ = &*IP_STATES;
+    let _ = &*PER_IP_RATE_LIMITED;
     let _ = &*CHALLENGE_ABANDONED;
     // Touch both challenge_type label values so the series appear on the first scrape
     // (no observation is recorded — just ensures the label combination is initialised).
@@ -184,6 +197,11 @@ pub fn challenge_solved(challenge_type: &str, elapsed_secs: f64) {
     CHALLENGE_SOLVE_DURATION
         .with_label_values(&[challenge_type])
         .observe(elapsed_secs);
+}
+
+/// Increment the per-IP rate limit counter.
+pub fn per_ip_rate_limited() {
+    PER_IP_RATE_LIMITED.inc();
 }
 
 /// Record `count` challenges that were abandoned (client state evicted before solve).
@@ -255,6 +273,14 @@ mod tests {
         let before = CHALLENGE_ABANDONED.get();
         challenge_abandoned(3);
         assert_eq!(CHALLENGE_ABANDONED.get(), before + 3);
+    }
+
+    #[test]
+    fn per_ip_rate_limited_increments_counter() {
+        let before = PER_IP_RATE_LIMITED.get();
+        per_ip_rate_limited();
+        per_ip_rate_limited();
+        assert_eq!(PER_IP_RATE_LIMITED.get(), before + 2);
     }
 
     #[test]
