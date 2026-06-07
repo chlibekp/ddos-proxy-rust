@@ -209,7 +209,7 @@ pub async fn route(
     }
     let path = req.uri().path();
     if path.starts_with("/admin/") || path == "/admin" {
-        return Ok(admin::handle(req, manager).await);
+        return Ok(admin::handle(req, ctx, manager).await);
     }
     Ok(manager.handle(req, ctx).await)
 }
