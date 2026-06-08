@@ -57,6 +57,7 @@ The proxy is configured via environment variables.
 | `PROXY_HTTP_PORT` | `80` | Port for the HTTP→HTTPS redirect server and ACME HTTP-01 challenges (SSL only). |
 | `PROXY_XDP_INTERFACE` | `""` | Network interface to attach the XDP program to (e.g. `eth0`). Requires the `xdp` build feature plus `NET_ADMIN`, `SYS_ADMIN`, `BPF` capabilities. |
 | `PROXY_MAX_IP_STATES` | `500000` | Cap on tracked client IP states (0 = unlimited) to bound memory under spoofed floods. |
+| `PROXY_DISCORD_WEBHOOK_URL` | `""` | Discord incoming-webhook URL. When set, a rich embed is posted to this channel whenever mitigation mode is triggered by sustained traffic exceeding **500 req/min** (~8.3 req/s). Alerts are rate-limited to at most **one per minute** to prevent webhook spam. Leave empty to disable. |
 
 ## Usage
 
@@ -123,6 +124,35 @@ When using `PROXY_XDP_INTERFACE`, the container requires:
 1. **Host Network Mode**: `network_mode: "host"`.
 2. **Capabilities**: `NET_ADMIN`, `SYS_ADMIN`, `BPF`.
 3. The image built with `--build-arg FEATURES=xdp`.
+
+## Discord DDoS Alerts
+
+When `PROXY_DISCORD_WEBHOOK_URL` is set the proxy posts a rich embed to your Discord channel every time it detects a sustained attack:
+
+```
+PROXY_DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/<id>/<token>
+```
+
+**What triggers an alert**
+
+- Mitigation mode is activated (global req/s or conn/s threshold breached), **and**
+- The current rate exceeds **500 requests per minute** (~8.3 req/s).
+
+Short traffic bursts below this threshold will not generate a notification, preventing alert fatigue from normal load spikes.
+
+**Alert content (embed fields)**
+
+| Field | Description |
+| :--- | :--- |
+| 📈 Current req/s | Observed rate at the moment mitigation triggered |
+| 🔺 Peak req/s (session) | Highest req/s seen since the proxy started |
+| ⚙️ Configured limit | Value of `PROXY_MAX_REQ` |
+| 🌐 Tracked IPs | Number of client IP states currently tracked |
+| 💥 5xx Responses | Cumulative backend 5xx errors since startup |
+
+**Rate limiting**: at most one Discord alert is sent per 60-second window, regardless of how frequently mitigation fires during an attack.
+
+**How to get a webhook URL**: in your Discord server go to *Channel Settings → Integrations → Webhooks → New Webhook*, copy the URL, and set it as `PROXY_DISCORD_WEBHOOK_URL`.
 
 ## Security Notes
 

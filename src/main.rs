@@ -2,6 +2,7 @@ mod admin;
 mod body;
 mod cache;
 mod config;
+mod discord;
 mod health;
 mod limiter;
 mod metrics;
@@ -105,7 +106,17 @@ async fn main() {
     };
 
     let proxy = Arc::new(Proxy::new(target.clone(), cfg.clone()));
-    let manager = Manager::new(cfg.clone(), rl.clone(), template_src, xdp_blocker, proxy);
+
+    let alerter = cfg
+        .discord_webhook_url
+        .as_deref()
+        .filter(|u| !u.is_empty())
+        .map(|u| {
+            tracing::info!(webhook = "<redacted>", "Discord DDoS alerting enabled");
+            discord::DiscordAlerter::new(u.to_string(), cfg.max_req_per_sec)
+        });
+
+    let manager = Manager::new(cfg.clone(), rl.clone(), template_src, xdp_blocker, proxy, alerter);
 
     // Rate limiter reset ticker (every second).
     {

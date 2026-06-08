@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 
 use crate::body::{empty, full, BoxedBody};
 use crate::config::Config;
+use crate::discord::DiscordAlerter;
 use crate::limiter::RateLimiter;
 use crate::metrics;
 use crate::proxy::{Proxy, ReqCtx};
@@ -29,6 +30,7 @@ pub struct Manager {
     env: Environment<'static>,
     xdp: Option<Arc<dyn Blocker>>,
     proxy: Arc<Proxy>,
+    alerter: Option<Arc<DiscordAlerter>>,
     mitigation_until: AtomicI64, // unix seconds
     js_challenge_until: AtomicI64, // unix seconds; while set, escalate cookie→JS challenge
     timeout_count: AtomicI64,
@@ -43,6 +45,7 @@ impl Manager {
         template_src: String,
         xdp: Option<Arc<dyn Blocker>>,
         proxy: Arc<Proxy>,
+        alerter: Option<Arc<DiscordAlerter>>,
     ) -> Arc<Self> {
         let mut env = Environment::new();
         env.add_template_owned("challenge.html", template_src)
@@ -54,6 +57,7 @@ impl Manager {
             env,
             xdp,
             proxy,
+            alerter,
             mitigation_until: AtomicI64::new(0),
             js_challenge_until: AtomicI64::new(0),
             timeout_count: AtomicI64::new(0),
@@ -524,6 +528,21 @@ impl Manager {
             self.mitigation_until
                 .store(now_s + mitigation_secs, Ordering::SeqCst);
             should_serve_challenge = true;
+
+            // Notify the Discord alerter of the active mitigation window.
+            if let Some(alerter) = &self.alerter {
+                let alerter = alerter.clone();
+                let mitigation_end = now_s + mitigation_secs;
+                let tracked = self.ip_state_count.load(Ordering::SeqCst);
+                let err_5xx = metrics::BACKEND_RESPONSES
+                    .with_label_values(&["5xx"])
+                    .get() as u64;
+                tokio::spawn(async move {
+                    alerter
+                        .notify_mitigation_active(mitigation_end, req_rate, tracked, err_5xx)
+                        .await;
+                });
+            }
         } else if now_s < mitigation_until {
             should_serve_challenge = true;
         } else if self.cfg.auto_mitigation_on_timeout
