@@ -80,6 +80,10 @@ impl Manager {
         self.cfg.prometheus_enabled
     }
 
+    pub fn proxy(&self) -> Arc<crate::proxy::Proxy> {
+        self.proxy.clone()
+    }
+
     pub fn config(&self) -> &Arc<Config> {
         &self.cfg
     }

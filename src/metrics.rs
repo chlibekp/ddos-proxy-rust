@@ -123,6 +123,21 @@ pub static PER_IP_RATE_LIMITED: Lazy<IntCounter> = Lazy::new(|| {
     c
 });
 
+/// Health check results counter, labelled by `result`: `"ok"` or `"error"`.
+/// Incremented on every request to the `/healthz` endpoint.
+pub static HEALTHZ_CHECKS: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "ddos_proxy_healthz_checks_total",
+            "Total health check requests, by result (ok or error)",
+        ),
+        &["result"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).unwrap();
+    c
+});
+
 /// Current number of tracked per-IP client states. Updated every 10 s by the cleanup ticker.
 pub static IP_STATES: Lazy<IntGauge> = Lazy::new(|| {
     let g = IntGauge::new(
@@ -159,6 +174,8 @@ pub fn init() {
     let _ = &*IP_STATES;
     let _ = &*PER_IP_RATE_LIMITED;
     let _ = &*CHALLENGE_ABANDONED;
+    HEALTHZ_CHECKS.with_label_values(&["ok"]).inc_by(0);
+    HEALTHZ_CHECKS.with_label_values(&["error"]).inc_by(0);
     // Touch both challenge_type label values so the series appear on the first scrape
     // (no observation is recorded — just ensures the label combination is initialised).
     let _ = CHALLENGE_SOLVE_DURATION.with_label_values(&["pow"]);

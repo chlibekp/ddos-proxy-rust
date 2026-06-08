@@ -2,6 +2,7 @@ mod admin;
 mod body;
 mod cache;
 mod config;
+mod health;
 mod limiter;
 mod metrics;
 mod proxy;
@@ -196,8 +197,8 @@ async fn serve_plain(
     tracing::info!("Server exited properly");
 }
 
-/// Route a request: `/metrics` and `/admin/` bypass the WAF; everything else
-/// goes through the WAF middleware.
+/// Route a request: `/metrics`, `/healthz`, and `/admin/` bypass the WAF;
+/// everything else goes through the WAF middleware.
 pub async fn route(
     req: Request<Incoming>,
     ctx: ReqCtx,
@@ -210,6 +211,10 @@ pub async fn route(
     let path = req.uri().path();
     if path.starts_with("/ddos-proxy/admin") {
         return Ok(admin::handle(req, ctx, manager).await);
+    }
+    let cfg = manager.config();
+    if cfg.healthz_enabled && path == cfg.healthz_path {
+        return Ok(health::handle(manager.proxy(), &cfg.healthz_backend_path.clone()).await);
     }
     Ok(manager.handle(req, ctx).await)
 }

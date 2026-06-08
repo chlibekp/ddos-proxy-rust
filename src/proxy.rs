@@ -99,6 +99,29 @@ impl Proxy {
         }
     }
 
+    /// Probes the backend by sending a HEAD request to `path` with a 5-second
+    /// timeout. Returns the HTTP status code on success or an error on failure.
+    pub async fn health_check(
+        &self,
+        path: &str,
+    ) -> Result<StatusCode, Box<dyn std::error::Error + Send + Sync>> {
+        let url = format!("{}://{}{}", self.target_scheme, self.target_host, path);
+        let uri: Uri = url.parse()?;
+
+        let req = Request::builder()
+            .method(Method::HEAD)
+            .uri(uri)
+            .header(http::header::HOST, &self.target_host)
+            .body(empty())?;
+
+        let resp = tokio::time::timeout(Duration::from_secs(5), self.client.request(req))
+            .await
+            .map_err(|_| "backend health check timed out")?
+            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+
+        Ok(resp.status())
+    }
+
     /// Main proxy entry point. Forwards `req` to the backend, applying the same
     /// header manipulation, JS injection and caching behaviour as the Go proxy.
     pub async fn handle(&self, req: Request<Incoming>, ctx: &ReqCtx) -> Response<BoxedBody> {
