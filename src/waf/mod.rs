@@ -529,22 +529,21 @@ impl Manager {
                 .store(now_s + mitigation_secs, Ordering::SeqCst);
             should_serve_challenge = true;
 
-            // Notify the Discord alerter of the active mitigation window.
+            // Notify the Discord alerter of the new/extended mitigation window.
             if let Some(alerter) = &self.alerter {
                 let alerter = alerter.clone();
                 let mitigation_end = now_s + mitigation_secs;
                 let tracked = self.ip_state_count.load(Ordering::SeqCst);
-                let err_5xx = metrics::BACKEND_RESPONSES
-                    .with_label_values(&["5xx"])
-                    .get() as u64;
                 tokio::spawn(async move {
-                    alerter
-                        .notify_mitigation_active(mitigation_end, req_rate, tracked, err_5xx)
-                        .await;
+                    alerter.notify_mitigation_active(mitigation_end, tracked).await;
                 });
             }
         } else if now_s < mitigation_until {
             should_serve_challenge = true;
+            // Keep the alerter's IP count fresh while the attack is ongoing.
+            if let Some(alerter) = &self.alerter {
+                alerter.update_ips(self.ip_state_count.load(Ordering::SeqCst));
+            }
         } else if self.cfg.auto_mitigation_on_timeout
             && self.timeout_count.load(Ordering::SeqCst) >= self.cfg.max_timeouts
         {
