@@ -113,7 +113,7 @@ async fn main() {
         .filter(|u| !u.is_empty())
         .map(|u| {
             tracing::info!(webhook = "<redacted>", "Discord DDoS alerting enabled");
-            discord::DiscordAlerter::new(u.to_string(), cfg.max_req_per_sec)
+            discord::DiscordAlerter::new(u.to_string(), cfg.max_req_per_sec, rl.clone())
         });
 
     let manager = Manager::new(cfg.clone(), rl.clone(), template_src, xdp_blocker, proxy, alerter);

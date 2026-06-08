@@ -4,11 +4,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
-/// Rate below which an attack is considered resolved (≤ 500 req/min).
+use crate::limiter::RateLimiter;
+use crate::metrics;
+
+/// Burst threshold: only alert when req/s exceeds 500 req/min (~8.3 req/s).
 pub const ALERT_THRESHOLD_RPS: i64 = 9;
 
 /// How often the background loop posts a progress update during an ongoing attack.
 const UPDATE_INTERVAL_SECS: u64 = 180; // 3 minutes
+
+/// Seconds to wait after the first trigger before reading "real" req/s for the initial alert.
+const WARMUP_SECS: u64 = 5;
 
 /// Minimum gap between initial alerts for back-to-back mitigation windows.
 const INITIAL_COOLDOWN_SECS: i64 = 60;
@@ -21,17 +27,14 @@ struct Snapshot {
     err_5xx: u64,
 }
 
-/// Shared state for the background update loop.
 struct Inner {
     /// Unix timestamp (seconds) until which mitigation is active; 0 = not active.
     mitigation_until: AtomicI64,
-    /// Stats provider: latest (req_per_sec, tracked_ips, 5xx_total).
-    latest_rps: AtomicI64,
+    /// Latest tracked-IP count pushed by the WAF.
     latest_ips: AtomicI64,
-    latest_5xx: AtomicU64,
-    /// Running peak req/s seen during the current session.
+    /// Running peak req/s seen during the current attack window.
     peak_rps: AtomicU64,
-    /// Unix timestamp of the first alert for the current attack window.
+    /// Unix timestamp when the current attack window started.
     attack_started_at: AtomicI64,
     /// Last time any Discord message was sent (initial or update).
     last_sent_at: AtomicI64,
@@ -39,27 +42,29 @@ struct Inner {
     attack_active: AtomicBool,
     /// Stats at the time of the previous Discord message (for trend comparison).
     prev_snapshot: Mutex<Option<Snapshot>>,
-    /// Max req/s configured in the proxy (used for embed context).
+    /// PROXY_MAX_REQ — shown in embeds for context.
     max_req_per_sec: i64,
 }
 
 /// Sends DDoS/suspicious-activity alerts to a Discord webhook.
-/// Fires an initial embed on attack detection, periodic update embeds every
-/// [`UPDATE_INTERVAL_SECS`] while mitigation remains active, and an all-clear
-/// embed once the attack subsides.
+///
+/// Lifecycle:
+///  1. **Initial embed** (red)   — fires ~5 s after mitigation activates (to read stable req/s).
+///  2. **Update embeds** (orange) — every 3 minutes while mitigation is still active.
+///  3. **All-clear embed** (green) — once the mitigation window expires.
 pub struct DiscordAlerter {
     webhook_url: String,
     client: reqwest::Client,
+    /// Live source of current req/s (reset every second by main's ticker).
+    rl: Arc<RateLimiter>,
     inner: Arc<Inner>,
 }
 
 impl DiscordAlerter {
-    pub fn new(webhook_url: String, max_req_per_sec: i64) -> Arc<Self> {
+    pub fn new(webhook_url: String, max_req_per_sec: i64, rl: Arc<RateLimiter>) -> Arc<Self> {
         let inner = Arc::new(Inner {
             mitigation_until: AtomicI64::new(0),
-            latest_rps: AtomicI64::new(0),
             latest_ips: AtomicI64::new(0),
-            latest_5xx: AtomicU64::new(0),
             peak_rps: AtomicU64::new(0),
             attack_started_at: AtomicI64::new(0),
             last_sent_at: AtomicI64::new(0),
@@ -71,14 +76,15 @@ impl DiscordAlerter {
         let alerter = Arc::new(DiscordAlerter {
             webhook_url,
             client: reqwest::Client::new(),
+            rl,
             inner: inner.clone(),
         });
 
-        // Background task: periodic update + all-clear.
+        // Background task: periodic update + all-clear detection.
         let weak = Arc::downgrade(&alerter);
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(UPDATE_INTERVAL_SECS));
-            ticker.tick().await; // discard immediate first tick
+            ticker.tick().await; // discard the immediate first tick
             loop {
                 ticker.tick().await;
                 let Some(a) = weak.upgrade() else { break };
@@ -89,37 +95,30 @@ impl DiscordAlerter {
         alerter
     }
 
-    /// Called by the WAF every time mitigation mode is (re)activated.
-    /// Fires the initial alert embed if this is the start of a new attack window,
-    /// and updates the shared stats so the background loop can track progress.
-    pub async fn notify_mitigation_active(
-        &self,
-        mitigation_until_unix: i64,
-        req_per_sec: i64,
-        tracked_ips: i64,
-        error_5xx: u64,
-    ) {
-        // Always keep the shared stats fresh.
-        self.inner.mitigation_until.store(mitigation_until_unix, Ordering::SeqCst);
-        self.inner.latest_rps.store(req_per_sec, Ordering::Relaxed);
+    /// Called by the WAF on every request where mitigation is (re)activated.
+    /// Updates live stats and fires the initial alert if this is a new attack window.
+    pub async fn notify_mitigation_active(&self, mitigation_until_unix: i64, tracked_ips: i64) {
+        self.inner
+            .mitigation_until
+            .store(mitigation_until_unix, Ordering::SeqCst);
         self.inner.latest_ips.store(tracked_ips, Ordering::Relaxed);
-        self.inner.latest_5xx.store(error_5xx, Ordering::Relaxed);
-        self.update_peak(req_per_sec);
 
-        // Below threshold → suppress alert (short burst ≤ 500 req/min).
-        if req_per_sec < ALERT_THRESHOLD_RPS {
+        // Read current rate from the live rate-limiter counter.
+        let (rps, _) = self.rl.get_counts();
+        self.update_peak(rps);
+
+        // Below burst threshold — suppress.
+        if rps < ALERT_THRESHOLD_RPS {
             return;
         }
 
-        let now = unix_now();
-
-        // If an attack window is already tracked, nothing to do here — the
-        // background loop handles updates.
+        // Already tracking an active attack window — background loop handles updates.
         if self.inner.attack_active.load(Ordering::SeqCst) {
             return;
         }
 
-        // Cooldown: don't re-alert if we just sent one.
+        // Cooldown between successive attack windows.
+        let now = unix_now();
         let last = self.inner.last_sent_at.load(Ordering::SeqCst);
         if now - last < INITIAL_COOLDOWN_SECS {
             return;
@@ -136,46 +135,68 @@ impl DiscordAlerter {
         }
 
         self.inner.attack_started_at.store(now, Ordering::SeqCst);
-        let peak = self.inner.peak_rps.load(Ordering::Relaxed) as i64;
 
-        let payload = build_initial_embed(
-            req_per_sec,
-            peak,
-            self.inner.max_req_per_sec,
-            tracked_ips,
-            error_5xx,
-        );
-        self.send(&payload, req_per_sec, tracked_ips, error_5xx).await;
+        // Spawn a task that waits WARMUP_SECS so the rate-limiter accumulates a
+        // stable reading before we read the "real" req/s and post the initial embed.
+        let weak_inner = Arc::downgrade(&self.inner);
+        let webhook = self.webhook_url.clone();
+        let client = self.client.clone();
+        let rl = self.rl.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(WARMUP_SECS)).await;
+            let Some(inner) = weak_inner.upgrade() else { return };
+            let (live_rps, _) = rl.get_counts();
+            let ips = inner.latest_ips.load(Ordering::Relaxed);
+            let err_5xx = backend_5xx();
+            let peak = inner.peak_rps.load(Ordering::Relaxed) as i64;
+
+            // Update peak with the post-warmup reading.
+            let rps_u = live_rps as u64;
+            let mut cur = inner.peak_rps.load(Ordering::Relaxed);
+            while rps_u > cur {
+                match inner.peak_rps.compare_exchange_weak(
+                    cur, rps_u, Ordering::Relaxed, Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(x) => cur = x,
+                }
+            }
+
+            let payload = build_initial_embed(live_rps, peak, inner.max_req_per_sec, ips, err_5xx);
+            send_embed(&client, &webhook, &payload, live_rps, ips, err_5xx, &inner).await;
+        });
     }
 
-    /// Fired every [`UPDATE_INTERVAL_SECS`] by the background task.
+    /// Fired every [`UPDATE_INTERVAL_SECS`] — posts an update or all-clear.
     async fn background_tick(&self) {
-        let now = unix_now();
-        let mitigation_until = self.inner.mitigation_until.load(Ordering::SeqCst);
-        let attack_active = self.inner.attack_active.load(Ordering::SeqCst);
-
-        if !attack_active {
+        if !self.inner.attack_active.load(Ordering::SeqCst) {
             return;
         }
 
-        let rps = self.inner.latest_rps.load(Ordering::Relaxed);
+        let now = unix_now();
+        let mitigation_until = self.inner.mitigation_until.load(Ordering::SeqCst);
+
+        // Read live stats.
+        let (rps, _) = self.rl.get_counts();
+        self.update_peak(rps);
         let ips = self.inner.latest_ips.load(Ordering::Relaxed);
-        let err_5xx = self.inner.latest_5xx.load(Ordering::Relaxed);
+        let err_5xx = backend_5xx();
         let peak = self.inner.peak_rps.load(Ordering::Relaxed) as i64;
         let started_at = self.inner.attack_started_at.load(Ordering::SeqCst);
         let duration_secs = now - started_at;
 
         if now >= mitigation_until {
-            // Attack ended — send all-clear and reset state.
+            // Attack ended — send all-clear and reset.
             self.inner.attack_active.store(false, Ordering::SeqCst);
             let prev = self.inner.prev_snapshot.lock().unwrap().clone();
             let payload = build_allclear_embed(rps, peak, ips, err_5xx, duration_secs, prev);
-            self.send(&payload, rps, ips, err_5xx).await;
-            // Reset peak for the next attack window.
+            send_embed(
+                &self.client, &self.webhook_url, &payload, rps, ips, err_5xx, &self.inner,
+            )
+            .await;
             self.inner.peak_rps.store(0, Ordering::Relaxed);
             *self.inner.prev_snapshot.lock().unwrap() = None;
         } else {
-            // Still under attack — send an update with trend commentary.
             let prev = self.inner.prev_snapshot.lock().unwrap().clone();
             let payload = build_update_embed(
                 rps,
@@ -186,23 +207,17 @@ impl DiscordAlerter {
                 duration_secs,
                 prev.as_ref(),
             );
-            self.send(&payload, rps, ips, err_5xx).await;
+            send_embed(
+                &self.client, &self.webhook_url, &payload, rps, ips, err_5xx, &self.inner,
+            )
+            .await;
         }
     }
 
-    /// Send a webhook payload and record the snapshot.
-    async fn send(&self, payload: &Value, rps: i64, ips: i64, err_5xx: u64) {
-        match self.client.post(&self.webhook_url).json(payload).send().await {
-            Ok(_) => {
-                let now = unix_now();
-                self.inner.last_sent_at.store(now, Ordering::SeqCst);
-                *self.inner.prev_snapshot.lock().unwrap() = Some(Snapshot { rps, ips, err_5xx });
-                tracing::info!(rps, ips, err_5xx, "Sent Discord DDoS alert");
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to send Discord DDoS alert");
-            }
-        }
+    /// Cheaply update the tracked-IP counter. Called by the WAF on every request
+    /// during an active mitigation window so the background loop always has fresh data.
+    pub fn update_ips(&self, count: i64) {
+        self.inner.latest_ips.store(count, Ordering::Relaxed);
     }
 
     fn update_peak(&self, rps: i64) {
@@ -210,10 +225,7 @@ impl DiscordAlerter {
         let mut cur = self.inner.peak_rps.load(Ordering::Relaxed);
         while rps_u > cur {
             match self.inner.peak_rps.compare_exchange_weak(
-                cur,
-                rps_u,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
+                cur, rps_u, Ordering::Relaxed, Ordering::Relaxed,
             ) {
                 Ok(_) => break,
                 Err(x) => cur = x,
@@ -222,15 +234,32 @@ impl DiscordAlerter {
     }
 }
 
-// ─── Embed builders ─────────────────────────────────────────────────────────
+// ─── HTTP send helper ────────────────────────────────────────────────────────
 
-fn build_initial_embed(
+async fn send_embed(
+    client: &reqwest::Client,
+    url: &str,
+    payload: &Value,
     rps: i64,
-    peak_rps: i64,
-    max_rps: i64,
     ips: i64,
     err_5xx: u64,
-) -> Value {
+    inner: &Arc<Inner>,
+) {
+    match client.post(url).json(payload).send().await {
+        Ok(_) => {
+            inner.last_sent_at.store(unix_now(), Ordering::SeqCst);
+            *inner.prev_snapshot.lock().unwrap() = Some(Snapshot { rps, ips, err_5xx });
+            tracing::info!(rps, ips, err_5xx, "Sent Discord DDoS alert");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to send Discord DDoS alert");
+        }
+    }
+}
+
+// ─── Embed builders ──────────────────────────────────────────────────────────
+
+fn build_initial_embed(rps: i64, peak: i64, max_rps: i64, ips: i64, err_5xx: u64) -> Value {
     json!({
         "embeds": [{
             "title": "🚨 DDoS / Suspicious Traffic Detected",
@@ -239,7 +268,7 @@ fn build_initial_embed(
                  (limit: `{max_rps}` req/s). All unverified clients are now being challenged."
             ),
             "color": 0xE74C3C,
-            "fields": rps_fields(rps, peak_rps, max_rps, ips, err_5xx, None),
+            "fields": rps_fields(rps, peak, max_rps, ips, err_5xx, None),
             "footer": { "text": "ddos-proxy  •  attack started" },
             "timestamp": iso8601_now()
         }]
@@ -248,7 +277,7 @@ fn build_initial_embed(
 
 fn build_update_embed(
     rps: i64,
-    peak_rps: i64,
+    peak: i64,
     max_rps: i64,
     ips: i64,
     err_5xx: u64,
@@ -264,8 +293,8 @@ fn build_update_embed(
             "description": format!(
                 "Mitigation is still **active** after {duration_str}. {trend}"
             ),
-            "color": 0xE67E22,   // orange
-            "fields": rps_fields(rps, peak_rps, max_rps, ips, err_5xx, prev),
+            "color": 0xE67E22,
+            "fields": rps_fields(rps, peak, max_rps, ips, err_5xx, prev),
             "footer": { "text": "ddos-proxy  •  mitigation ongoing" },
             "timestamp": iso8601_now()
         }]
@@ -274,13 +303,15 @@ fn build_update_embed(
 
 fn build_allclear_embed(
     rps: i64,
-    peak_rps: i64,
+    peak: i64,
     ips: i64,
     err_5xx: u64,
     duration_secs: i64,
-    _prev: Option<Snapshot>,
+    prev: Option<Snapshot>,
 ) -> Value {
     let duration_str = format_duration(duration_secs);
+    let prev_5xx = prev.as_ref().map(|p| p.err_5xx).unwrap_or(0);
+    let new_5xx = err_5xx.saturating_sub(prev_5xx);
 
     json!({
         "embeds": [{
@@ -289,33 +320,14 @@ fn build_allclear_embed(
                 "Traffic has dropped below the alert threshold. Mitigation mode \
                  **deactivated** after {duration_str}. Normal proxying resumed."
             ),
-            "color": 0x2ECC71,   // green
+            "color": 0x2ECC71,
             "fields": [
-                {
-                    "name": "⏱️ Attack Duration",
-                    "value": format!("`{duration_str}`"),
-                    "inline": true
-                },
-                {
-                    "name": "🔺 Peak req/s",
-                    "value": format!("`{peak_rps}` req/s"),
-                    "inline": true
-                },
-                {
-                    "name": "🌐 Final Tracked IPs",
-                    "value": format!("`{ips}`"),
-                    "inline": true
-                },
-                {
-                    "name": "💥 Total 5xx Responses",
-                    "value": format!("`{err_5xx}`"),
-                    "inline": true
-                },
-                {
-                    "name": "📉 Current req/s",
-                    "value": format!("`{rps}` req/s"),
-                    "inline": true
-                }
+                { "name": "⏱️ Attack Duration",      "value": format!("`{duration_str}`"),   "inline": true },
+                { "name": "🔺 Peak req/s",           "value": format!("`{peak}` req/s"),     "inline": true },
+                { "name": "📉 Current req/s",        "value": format!("`{rps}` req/s"),      "inline": true },
+                { "name": "🌐 Final Tracked IPs",    "value": format!("`{ips}`"),            "inline": true },
+                { "name": "💥 5xx During Attack",    "value": format!("`{new_5xx}` new"),    "inline": true },
+                { "name": "💥 5xx Total (session)",  "value": format!("`{err_5xx}` total"),  "inline": true },
             ],
             "footer": { "text": "ddos-proxy  •  attack resolved" },
             "timestamp": iso8601_now()
@@ -323,10 +335,9 @@ fn build_allclear_embed(
     })
 }
 
-/// Common embed fields for initial + update messages.
 fn rps_fields(
     rps: i64,
-    peak_rps: i64,
+    peak: i64,
     max_rps: i64,
     ips: i64,
     err_5xx: u64,
@@ -334,6 +345,7 @@ fn rps_fields(
 ) -> Value {
     let rps_delta = prev.map(|p| rps - p.rps);
     let ips_delta = prev.map(|p| ips - p.ips);
+    let err_delta = prev.map(|p| err_5xx.saturating_sub(p.err_5xx));
 
     let rps_display = match rps_delta {
         Some(d) if d > 0 => format!("`{rps}` req/s  ▲ `+{d}`"),
@@ -342,20 +354,23 @@ fn rps_fields(
     };
     let ips_display = match ips_delta {
         Some(d) if d > 0 => format!("`{ips}`  ▲ `+{d}` new"),
-        Some(d) if d < 0 => format!("`{ips}`  ▼ `{d}` cleared"),
+        Some(d) if d < 0 => format!("`{ips}`  ▼ `{}` cleared", d.abs()),
         _ => format!("`{ips}`"),
+    };
+    let err_display = match err_delta {
+        Some(d) if d > 0 => format!("`{err_5xx}` total  (+`{d}` since last update)"),
+        _ => format!("`{err_5xx}` total"),
     };
 
     json!([
-        { "name": "📈 Current req/s",        "value": rps_display,                              "inline": true  },
-        { "name": "🔺 Peak req/s (session)", "value": format!("`{peak_rps}` req/s"),            "inline": true  },
-        { "name": "⚙️ Configured limit",     "value": format!("`{max_rps}` req/s"),             "inline": true  },
-        { "name": "🌐 Tracked IPs",           "value": ips_display,                              "inline": true  },
-        { "name": "💥 5xx Responses",         "value": format!("`{err_5xx}` total"),             "inline": true  }
+        { "name": "📈 Current req/s",        "value": rps_display,                   "inline": true },
+        { "name": "🔺 Peak req/s (session)", "value": format!("`{peak}` req/s"),     "inline": true },
+        { "name": "⚙️ Configured limit",     "value": format!("`{max_rps}` req/s"),  "inline": true },
+        { "name": "🌐 Tracked IPs",           "value": ips_display,                   "inline": true },
+        { "name": "💥 5xx Responses",         "value": err_display,                   "inline": true }
     ])
 }
 
-/// Returns a short human-readable sentence describing the traffic trend.
 fn trend_description(rps: i64, ips: i64, err_5xx: u64, prev: Option<&Snapshot>) -> &'static str {
     let Some(p) = prev else {
         return "Traffic is ongoing.";
@@ -365,13 +380,27 @@ fn trend_description(rps: i64, ips: i64, err_5xx: u64, prev: Option<&Snapshot>) 
     let err_diff = err_5xx as i64 - p.err_5xx as i64;
 
     match (rps_diff, ips_diff, err_diff) {
-        (r, _, _) if r > 50 => "🔥 Attack is **intensifying** — request rate has risen significantly.",
-        (r, _, _) if r < -50 => "📉 Traffic is **easing off** — request rate has dropped since the last update.",
-        (_, i, _) if i > 100 => "🌐 The **number of attacking IPs is growing** — possible distributed flood.",
-        (_, i, _) if i < -100 => "🌐 The **number of active IPs is shrinking** — possible targeted flood winding down.",
-        (_, _, e) if e > 500 => "💥 **Elevated backend errors** — the origin may be under stress.",
-        _ => "⚖️ Traffic levels are **holding steady** — mitigation is actively blocking requests.",
+        (r, _, _) if r > 50 =>
+            "🔥 Attack is **intensifying** — request rate has risen significantly.",
+        (r, _, _) if r < -50 =>
+            "📉 Traffic is **easing off** — request rate has dropped since the last update.",
+        (_, i, _) if i > 100 =>
+            "🌐 The **number of attacking IPs is growing** — possible distributed flood.",
+        (_, i, _) if i < -100 =>
+            "🌐 The **number of active IPs is shrinking** — flood may be winding down.",
+        (_, _, e) if e > 500 =>
+            "💥 **Elevated backend errors** — the origin may be under stress.",
+        _ =>
+            "⚖️ Traffic levels are **holding steady** — mitigation is actively blocking requests.",
     }
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+fn backend_5xx() -> u64 {
+    metrics::BACKEND_RESPONSES
+        .with_label_values(&["5xx"])
+        .get() as u64
 }
 
 fn format_duration(secs: i64) -> String {
@@ -391,7 +420,6 @@ fn unix_now() -> i64 {
         .as_secs() as i64
 }
 
-/// ISO-8601 timestamp for Discord embeds: `YYYY-MM-DDTHH:MM:SS.000Z`
 fn iso8601_now() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -400,8 +428,7 @@ fn iso8601_now() -> String {
     let s = secs % 60;
     let m = (secs / 60) % 60;
     let h = (secs / 3600) % 24;
-    let days = secs / 86400;
-    let (year, month, day) = days_to_ymd(days);
+    let (year, month, day) = days_to_ymd(secs / 86400);
     format!("{year:04}-{month:02}-{day:02}T{h:02}:{m:02}:{s:02}.000Z")
 }
 
@@ -409,9 +436,7 @@ fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
     let mut year = 1970u64;
     loop {
         let dy = if is_leap(year) { 366 } else { 365 };
-        if days < dy {
-            break;
-        }
+        if days < dy { break; }
         days -= dy;
         year += 1;
     }
@@ -422,9 +447,7 @@ fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
     };
     let mut month = 1u64;
     for dm in months {
-        if days < dm {
-            break;
-        }
+        if days < dm { break; }
         days -= dm;
         month += 1;
     }
