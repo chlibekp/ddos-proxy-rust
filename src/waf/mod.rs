@@ -376,6 +376,10 @@ impl Manager {
 
     /// Main WAF entry point.
     pub async fn handle(self: &Arc<Self>, req: Request<Incoming>, ctx: ReqCtx) -> Response<BoxedBody> {
+        // Count every incoming request (allowed, challenged, or blocked) so the
+        // alerter can report true incoming traffic rate, not just proxied requests.
+        self.rl.inc_total();
+
         if is_websocket_upgrade(&req) {
             return self.proxy.handle(req, &ctx).await;
         }
