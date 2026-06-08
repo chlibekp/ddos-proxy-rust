@@ -49,6 +49,11 @@ pub struct Config {
     pub healthz_path: String,
     /// Path to probe on the backend when performing a health check (default: `/`).
     pub healthz_backend_path: String,
+
+    /// Optional Discord incoming-webhook URL for DDoS/suspicious-traffic alerts.
+    /// Alerts are suppressed for bursts ≤ 500 req/min and rate-limited to one per minute.
+    /// `None` disables alerting.
+    pub discord_webhook_url: Option<String>,
 }
 
 /// Error returned when required configuration is missing.
@@ -187,6 +192,8 @@ impl Config {
         let healthz_path = env_nonempty("PROXY_HEALTHZ_PATH").unwrap_or_else(|| "/healthz".to_string());
         let healthz_backend_path = env_nonempty("PROXY_HEALTHZ_BACKEND_PATH").unwrap_or_else(|| "/".to_string());
 
+        let discord_webhook_url = env_nonempty("PROXY_DISCORD_WEBHOOK_URL");
+
         Ok(Config {
             backend_url,
             port,
@@ -224,6 +231,7 @@ impl Config {
             healthz_enabled,
             healthz_path,
             healthz_backend_path,
+            discord_webhook_url,
         })
     }
 }
