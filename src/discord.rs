@@ -103,8 +103,9 @@ impl DiscordAlerter {
             .store(mitigation_until_unix, Ordering::SeqCst);
         self.inner.latest_ips.store(tracked_ips, Ordering::Relaxed);
 
-        // Read current rate from the live rate-limiter counter.
-        let (rps, _) = self.rl.get_counts();
+        // True incoming req/s over the last complete second (counts challenged
+        // and blocked requests too, unlike the proxied-only req_count).
+        let rps = self.rl.get_last_second_total();
         self.update_peak(rps);
 
         // Below burst threshold — suppress.
@@ -137,7 +138,8 @@ impl DiscordAlerter {
         self.inner.attack_started_at.store(now, Ordering::SeqCst);
 
         // Spawn a task that waits WARMUP_SECS so the rate-limiter accumulates a
-        // stable reading before we read the "real" req/s and post the initial embed.
+        // stable full-second reading before we read the "real" req/s and post the
+        // initial embed.
         let weak_inner = Arc::downgrade(&self.inner);
         let webhook = self.webhook_url.clone();
         let client = self.client.clone();
@@ -145,7 +147,7 @@ impl DiscordAlerter {
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(WARMUP_SECS)).await;
             let Some(inner) = weak_inner.upgrade() else { return };
-            let (live_rps, _) = rl.get_counts();
+            let live_rps = rl.get_last_second_total();
             let ips = inner.latest_ips.load(Ordering::Relaxed);
             let err_5xx = backend_5xx();
             let peak = inner.peak_rps.load(Ordering::Relaxed) as i64;
@@ -176,8 +178,8 @@ impl DiscordAlerter {
         let now = unix_now();
         let mitigation_until = self.inner.mitigation_until.load(Ordering::SeqCst);
 
-        // Read live stats.
-        let (rps, _) = self.rl.get_counts();
+        // Read live stats — true incoming req/s over the last complete second.
+        let rps = self.rl.get_last_second_total();
         self.update_peak(rps);
         let ips = self.inner.latest_ips.load(Ordering::Relaxed);
         let err_5xx = backend_5xx();

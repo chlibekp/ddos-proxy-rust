@@ -10,6 +10,13 @@ pub struct RateLimiter {
     req_count: AtomicI64,
     conn_count: AtomicI64,
     whitelist_req_count: AtomicI64,
+    /// Every incoming request entering the WAF (allowed OR challenged/blocked),
+    /// counted within the current 1-second window.
+    total_req_count: AtomicI64,
+    /// Snapshot of `total_req_count` for the previous *complete* second, taken at
+    /// reset. Reading this always yields a full-second figure (true req/s) rather
+    /// than a partial in-progress count.
+    last_second_total: AtomicI64,
 }
 
 impl RateLimiter {
@@ -18,7 +25,11 @@ impl RateLimiter {
     }
 
     /// Reset the request, connection and whitelist counts to zero.
+    /// The total-incoming counter is snapshotted into `last_second_total` first
+    /// so consumers can read an accurate full-second req/s.
     pub fn reset(&self) {
+        let total = self.total_req_count.swap(0, Ordering::SeqCst);
+        self.last_second_total.store(total, Ordering::SeqCst);
         self.req_count.store(0, Ordering::SeqCst);
         self.conn_count.store(0, Ordering::SeqCst);
         self.whitelist_req_count.store(0, Ordering::SeqCst);
@@ -34,6 +45,17 @@ impl RateLimiter {
 
     pub fn inc_whitelist_req(&self) {
         self.whitelist_req_count.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Count one incoming request (regardless of whether it is allowed, challenged
+    /// or blocked). Used to measure true incoming traffic rate for alerting.
+    pub fn inc_total(&self) {
+        self.total_req_count.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Total incoming requests over the previous complete second (true req/s).
+    pub fn get_last_second_total(&self) -> i64 {
+        self.last_second_total.load(Ordering::SeqCst)
     }
 
     /// Returns (request_count, connection_count).
