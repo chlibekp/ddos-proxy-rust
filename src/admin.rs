@@ -462,6 +462,9 @@ mod tests {
             cookie_challenge: true,
             max_req_per_ip: None,
             admin_secret: secret.map(|s| s.to_string()),
+            healthz_enabled: true,
+            healthz_path: "/healthz".to_string(),
+            healthz_backend_path: "/".to_string(),
         });
         let rl = Arc::new(RateLimiter::new());
         let target: http::Uri = "http://127.0.0.1:8081".parse().unwrap();

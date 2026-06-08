@@ -42,6 +42,13 @@ pub struct Config {
     pub max_req_per_ip: Option<i64>,
     /// Bearer token that protects the `/ddos-proxy/admin/` endpoints. `None` disables the admin API.
     pub admin_secret: Option<String>,
+
+    /// Whether the `/healthz` endpoint is enabled (default: true).
+    pub healthz_enabled: bool,
+    /// Path on which the health check endpoint is served (default: `/healthz`).
+    pub healthz_path: String,
+    /// Path to probe on the backend when performing a health check (default: `/`).
+    pub healthz_backend_path: String,
 }
 
 /// Error returned when required configuration is missing.
@@ -174,6 +181,12 @@ impl Config {
 
         let admin_secret = env_nonempty("PROXY_ADMIN_SECRET");
 
+        // Health check endpoint configuration.
+        // PROXY_HEALTHZ_ENABLED defaults to true; set to "false" or "0" to disable.
+        let healthz_enabled = !matches!(env::var("PROXY_HEALTHZ_ENABLED").as_deref(), Ok("false") | Ok("0"));
+        let healthz_path = env_nonempty("PROXY_HEALTHZ_PATH").unwrap_or_else(|| "/healthz".to_string());
+        let healthz_backend_path = env_nonempty("PROXY_HEALTHZ_BACKEND_PATH").unwrap_or_else(|| "/".to_string());
+
         Ok(Config {
             backend_url,
             port,
@@ -208,6 +221,9 @@ impl Config {
             cookie_challenge,
             max_req_per_ip,
             admin_secret,
+            healthz_enabled,
+            healthz_path,
+            healthz_backend_path,
         })
     }
 }
