@@ -17,8 +17,10 @@ const UPDATE_INTERVAL_SECS: u64 = 180; // 3 minutes
 /// Seconds to wait after the first trigger before reading "real" req/s for the initial alert.
 const WARMUP_SECS: u64 = 5;
 
-/// Minimum gap between initial alerts for back-to-back mitigation windows.
-const INITIAL_COOLDOWN_SECS: i64 = 60;
+/// Minimum gap between two successive initial alerts (Start embeds).
+/// Applies after both a fresh start and after an all-clear, so a burst/pause/burst
+/// pattern doesn't generate a Start→Clear→Start→Clear spam cycle.
+const INITIAL_COOLDOWN_SECS: i64 = 300; // 5 minutes
 
 /// Snapshot of stats captured at the time of the last Discord message.
 #[derive(Clone)]
@@ -286,45 +288,46 @@ pub struct L4Reasons {
     pub tcp_malformed: u64,
     pub http_invalid: u64,
     pub tls_invalid: u64,
+    pub icmp: u64,
+    pub bad_flags: u64,
+    pub fragment: u64,
+    pub amplify: u64,
+    pub syn_flood: u64,
 }
 
 /// Pick the dominant drop category and return a (short label, description) pair.
-fn classify_l4(r: &L4Reasons) -> (&'static str, &'static str) {
-    let candidates = [
-        (
-            r.udp,
-            "UDP flood",
-            "High volume of UDP packets to ports 80/443 — dropped wholesale at L4 (the proxy serves no UDP).",
-        ),
-        (
-            r.http_invalid,
-            "Non-HTTP junk flood (:80)",
-            "TCP payloads to :80 whose first bytes are not a valid HTTP request line — raw garbage/replay flood.",
-        ),
-        (
-            r.tls_invalid,
-            "Non-TLS junk flood (:443)",
-            "TCP payloads to :443 that are not a TLS ClientHello — malformed/replayed TLS flood.",
-        ),
-        (
-            r.tcp_malformed,
-            "Malformed-TCP flood",
-            "Truncated or malformed TCP segments — crafted packets / spoofed-header flood.",
-        ),
-        (
-            r.blocklist,
-            "Blocklisted-IP flood",
-            "Packets from source IPs already on the XDP blocklist (repeat offenders).",
-        ),
+/// Public so `main::spawn_xdp_stats` can pass the type label to Prometheus.
+pub fn classify_l4_reasons(r: &L4Reasons) -> (&'static str, &'static str) {
+    let candidates: &[(u64, &'static str, &'static str)] = &[
+        (r.syn_flood,    "SYN flood",
+         "Per-source-IP SYN rate exceeded — TCP SYN flood targeting the kernel connection table."),
+        (r.udp,          "UDP flood",
+         "High volume of UDP to ports 80/443 — no UDP service runs there; pure volumetric junk."),
+        (r.amplify,      "Amplification/reflection attack",
+         "UDP from known reflection ports (DNS :53, NTP :123, SSDP :1900, Memcached :11211, LDAP :389 …) — attacker spoofed victim's IP to reflectors; amplified responses are landing here."),
+        (r.icmp,         "ICMP echo (ping) flood",
+         "High volume of ICMP echo requests — classic ping flood or ICMP amplification."),
+        (r.fragment,     "IP fragmentation flood",
+         "Fragmented IPv4 packets (MF bit or non-zero offset) — fragmentation attack or evasion attempt; legitimate HTTP/TLS is never fragmented."),
+        (r.bad_flags,    "Malformed TCP flags (Xmas/NULL/SYN+FIN)",
+         "TCP packets with impossible or abusive flag combinations (NULL scan, Xmas tree, SYN+FIN, RST+SYN) — crafted packet flood / scanner storm."),
+        (r.http_invalid, "Non-HTTP junk flood (:80)",
+         "TCP payloads to :80 whose first bytes are not a valid HTTP request line — raw garbage/replay flood."),
+        (r.tls_invalid,  "Non-TLS junk flood (:443)",
+         "TCP payloads to :443 that are not a TLS ClientHello — malformed/replayed junk flood."),
+        (r.tcp_malformed,"Malformed-TCP flood",
+         "Truncated or header-level malformed TCP segments — crafted-packet flood or spoofed-header storm."),
+        (r.blocklist,    "Blocklisted-IP flood",
+         "Packets from source IPs already on the XDP blocklist — repeat-offender flood."),
     ];
     let mut best: (u64, &'static str, &'static str) = (
         0,
         "Mixed L4 flood",
         "Multiple drop categories with no single dominant type.",
     );
-    for c in candidates {
-        if c.0 > best.0 {
-            best = c;
+    for &(n, label, desc) in candidates {
+        if n > best.0 {
+            best = (n, label, desc);
         }
     }
     (best.1, best.2)
@@ -361,13 +364,14 @@ fn render_fingerprints(fps: &[Fingerprint]) -> String {
 
 fn l4_breakdown(r: &L4Reasons) -> String {
     format!(
-        "UDP `{}` • :80 junk `{}` • :443 junk `{}` • bad-TCP `{}` • blocklist `{}`",
-        r.udp, r.http_invalid, r.tls_invalid, r.tcp_malformed, r.blocklist
+        "SYN flood `{}` • UDP `{}` • amplify `{}` • ICMP `{}` • fragment `{}` • bad flags `{}` • :80 junk `{}` • :443 junk `{}` • bad TCP `{}` • blocklist `{}`",
+        r.syn_flood, r.udp, r.amplify, r.icmp, r.fragment,
+        r.bad_flags, r.http_invalid, r.tls_invalid, r.tcp_malformed, r.blocklist
     )
 }
 
 fn build_l4_initial(pps: u64, peak: u64, reasons: &L4Reasons, fps: &[Fingerprint]) -> Value {
-    let (label, desc) = classify_l4(reasons);
+    let (label, desc) = classify_l4_reasons(reasons);
     json!({
         "embeds": [{
             "title": "🛑 L4 Flood Detected (XDP)",
@@ -388,7 +392,7 @@ fn build_l4_initial(pps: u64, peak: u64, reasons: &L4Reasons, fps: &[Fingerprint
 }
 
 fn build_l4_update(pps: u64, peak: u64, reasons: &L4Reasons, fps: &[Fingerprint]) -> Value {
-    let (label, desc) = classify_l4(reasons);
+    let (label, desc) = classify_l4_reasons(reasons);
     json!({
         "embeds": [{
             "title": "⚠️ L4 Flood — Update",
@@ -410,7 +414,7 @@ fn build_l4_update(pps: u64, peak: u64, reasons: &L4Reasons, fps: &[Fingerprint]
 
 fn build_l4_clear(peak: u64, duration_secs: i64, reasons: &L4Reasons) -> Value {
     let duration_str = format_duration(duration_secs);
-    let (label, _) = classify_l4(reasons);
+    let (label, _) = classify_l4_reasons(reasons);
     json!({
         "embeds": [{
             "title": "✅ L4 Flood Subsided (XDP)",

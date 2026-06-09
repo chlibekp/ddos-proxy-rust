@@ -25,6 +25,11 @@ pub struct Stats {
     pub drop_tcp_malformed: u64,
     pub drop_http_invalid: u64,
     pub drop_tls_invalid: u64,
+    pub drop_icmp: u64,
+    pub drop_bad_flags: u64,
+    pub drop_fragment: u64,
+    pub drop_amplify: u64,
+    pub drop_syn_flood: u64,
 }
 
 /// A captured byte signature of repeatedly-dropped packets: the first
@@ -83,6 +88,11 @@ mod imp {
         drop_tcp_malformed: u64,
         drop_http_invalid: u64,
         drop_tls_invalid: u64,
+        drop_icmp: u64,
+        drop_bad_flags: u64,
+        drop_fragment: u64,
+        drop_amplify: u64,
+        drop_syn_flood: u64,
     }
     unsafe impl aya::Pod for BpfStats {}
 
@@ -152,6 +162,11 @@ mod imp {
                 drop_tcp_malformed: s.drop_tcp_malformed,
                 drop_http_invalid: s.drop_http_invalid,
                 drop_tls_invalid: s.drop_tls_invalid,
+                drop_icmp: s.drop_icmp,
+                drop_bad_flags: s.drop_bad_flags,
+                drop_fragment: s.drop_fragment,
+                drop_amplify: s.drop_amplify,
+                drop_syn_flood: s.drop_syn_flood,
             })
         }
 

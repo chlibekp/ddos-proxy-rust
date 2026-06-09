@@ -1,5 +1,5 @@
 use once_cell::sync::Lazy;
-use prometheus::{Encoder, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts, Registry, TextEncoder};
+use prometheus::{Encoder, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts, Registry, TextEncoder};
 
 /// Dedicated registry (equivalent to Go's promauto default registry).
 pub static REGISTRY: Lazy<Registry> = Lazy::new(Registry::new);
@@ -67,6 +67,49 @@ pub static XDP_DROPS: Lazy<IntCounterVec> = Lazy::new(|| {
     .unwrap();
     REGISTRY.register(Box::new(c.clone())).unwrap();
     c
+});
+
+/// Whether an L4/XDP flood is currently in progress, labelled by `attack_type`.
+/// The gauge is 1 while the flood is active and 0 once it clears. Having the
+/// attack type as a label means you can alert on a specific class (e.g. SYN flood)
+/// directly in Prometheus/Grafana without parsing log lines.
+pub static XDP_L4_FLOOD_ACTIVE: Lazy<IntGaugeVec> = Lazy::new(|| {
+    let g = IntGaugeVec::new(
+        Opts::new(
+            "ddos_proxy_xdp_l4_flood_active",
+            "1 while an L4/XDP flood is in progress, labelled by the dominant attack type",
+        ),
+        &["attack_type"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(g.clone())).unwrap();
+    g
+});
+
+/// Total seconds spent under an active L4/XDP flood. Incremented every second
+/// while `xdp_l4_flood_active > 0`. Useful for computing flood-time percentage
+/// over an interval and for SLO burn-rate calculations.
+pub static XDP_FLOOD_SECONDS: Lazy<IntCounter> = Lazy::new(|| {
+    let c = IntCounter::new(
+        "ddos_proxy_xdp_flood_seconds_total",
+        "Total seconds the proxy has spent under an active L4/XDP flood",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).unwrap();
+    c
+});
+
+/// Current dropped-packets-per-second rate as seen by the XDP stats loop.
+/// Updated every second; gives Grafana a live pkt/s gauge without needing
+/// Prometheus rate() over a counter.
+pub static XDP_DROP_RATE: Lazy<IntGauge> = Lazy::new(|| {
+    let g = IntGauge::new(
+        "ddos_proxy_xdp_drop_rate_pps",
+        "Current dropped-packets-per-second rate at the XDP layer (updated every second)",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(g.clone())).unwrap();
+    g
 });
 
 /// Backend HTTP response counter, labelled by status class: 2xx, 3xx, 4xx, 5xx, or error.
@@ -191,9 +234,22 @@ pub fn init() {
         .inc_by(0);
     XDP_PACKETS.with_label_values(&["allowed"]).inc_by(0);
     XDP_PACKETS.with_label_values(&["blocked"]).inc_by(0);
-    for reason in ["blocklist", "udp", "tcp_malformed", "http_invalid", "tls_invalid"] {
+    for reason in [
+        "blocklist", "udp", "tcp_malformed", "http_invalid", "tls_invalid",
+        "icmp", "bad_flags", "fragment", "amplify", "syn_flood",
+    ] {
         XDP_DROPS.with_label_values(&[reason]).inc_by(0);
     }
+    // Touch the L4-flood gauges so all label combinations appear on first scrape.
+    for attack_type in [
+        "syn_flood", "udp_flood", "amplification", "icmp_flood",
+        "ip_fragmentation", "bad_tcp_flags", "http_junk", "tls_junk",
+        "malformed_tcp", "blocklist_flood", "mixed",
+    ] {
+        XDP_L4_FLOOD_ACTIVE.with_label_values(&[attack_type]).set(0);
+    }
+    let _ = &*XDP_FLOOD_SECONDS;
+    let _ = &*XDP_DROP_RATE;
     BACKEND_RESPONSES.with_label_values(&["2xx"]).inc_by(0);
     BACKEND_RESPONSES.with_label_values(&["3xx"]).inc_by(0);
     BACKEND_RESPONSES.with_label_values(&["4xx"]).inc_by(0);
@@ -271,6 +327,54 @@ pub fn status_class(code: u16) -> &'static str {
         400..=499 => "4xx",
         500..=599 => "5xx",
         _ => "other",
+    }
+}
+
+/// Update L4-flood state metrics. Call every second from the XDP stats loop.
+///
+/// `active_type` is `Some("syn_flood")` etc. while a flood is in progress, or
+/// `None` when no flood is active. `drop_pps` is the current dropped pkt/s.
+pub fn xdp_l4_flood_state(active_type: Option<&str>, drop_pps: i64) {
+    XDP_DROP_RATE.set(drop_pps);
+    let canonical_type = active_type.map(attack_type_label).unwrap_or("mixed");
+    if active_type.is_some() {
+        // Set the active label to 1, all others to 0.
+        for label in [
+            "syn_flood", "udp_flood", "amplification", "icmp_flood",
+            "ip_fragmentation", "bad_tcp_flags", "http_junk", "tls_junk",
+            "malformed_tcp", "blocklist_flood", "mixed",
+        ] {
+            XDP_L4_FLOOD_ACTIVE
+                .with_label_values(&[label])
+                .set(if label == canonical_type { 1 } else { 0 });
+        }
+        XDP_FLOOD_SECONDS.inc();
+    } else {
+        // No flood: zero all labels.
+        for label in [
+            "syn_flood", "udp_flood", "amplification", "icmp_flood",
+            "ip_fragmentation", "bad_tcp_flags", "http_junk", "tls_junk",
+            "malformed_tcp", "blocklist_flood", "mixed",
+        ] {
+            XDP_L4_FLOOD_ACTIVE.with_label_values(&[label]).set(0);
+        }
+    }
+}
+
+/// Map a classify_l4 label string to a Prometheus-safe attack_type label value.
+fn attack_type_label(classify_label: &str) -> &'static str {
+    match classify_label {
+        s if s.starts_with("SYN")           => "syn_flood",
+        s if s.starts_with("UDP")           => "udp_flood",
+        s if s.starts_with("Amplification") => "amplification",
+        s if s.starts_with("ICMP")          => "icmp_flood",
+        s if s.starts_with("IP frag")       => "ip_fragmentation",
+        s if s.starts_with("Malformed TCP") => "bad_tcp_flags",
+        s if s.starts_with("Non-HTTP")      => "http_junk",
+        s if s.starts_with("Non-TLS")       => "tls_junk",
+        s if s.starts_with("Malformed-TCP") => "malformed_tcp",
+        s if s.starts_with("Blocklisted")   => "blocklist_flood",
+        _                                   => "mixed",
     }
 }
 
