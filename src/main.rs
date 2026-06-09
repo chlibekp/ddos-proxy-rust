@@ -71,6 +71,17 @@ async fn main() {
 
     let rl = Arc::new(RateLimiter::new());
 
+    // Discord alerter (optional). Created before the XDP blocker so the L4 stats
+    // loop can drive flood alerts through it.
+    let alerter = cfg
+        .discord_webhook_url
+        .as_deref()
+        .filter(|u| !u.is_empty())
+        .map(|u| {
+            tracing::info!(webhook = "<redacted>", "Discord DDoS alerting enabled");
+            discord::DiscordAlerter::new(u.to_string(), cfg.max_req_per_sec, rl.clone())
+        });
+
     // XDP blocker (optional, Linux + feature `xdp`).
     let xdp_blocker: Option<Arc<dyn xdp::Blocker>> = if !cfg.xdp_interface.is_empty() {
         #[cfg(all(target_os = "linux", feature = "xdp"))]
@@ -79,7 +90,7 @@ async fn main() {
             match xdp::init_xdp(&cfg.xdp_interface) {
                 Ok(b) => {
                     let blocker: Arc<dyn xdp::Blocker> = Arc::new(b);
-                    spawn_xdp_stats(blocker.clone(), cfg.clone());
+                    spawn_xdp_stats(blocker.clone(), cfg.clone(), alerter.clone());
                     Some(blocker)
                 }
                 Err(e) => {
@@ -106,15 +117,6 @@ async fn main() {
     };
 
     let proxy = Arc::new(Proxy::new(target.clone(), cfg.clone()));
-
-    let alerter = cfg
-        .discord_webhook_url
-        .as_deref()
-        .filter(|u| !u.is_empty())
-        .map(|u| {
-            tracing::info!(webhook = "<redacted>", "Discord DDoS alerting enabled");
-            discord::DiscordAlerter::new(u.to_string(), cfg.max_req_per_sec, rl.clone())
-        });
 
     let manager = Manager::new(cfg.clone(), rl.clone(), template_src, xdp_blocker, proxy, alerter);
 
@@ -275,52 +277,142 @@ pub fn signal_future() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>
     })
 }
 
-/// Per-second XDP stats logging + metrics, mirroring the Go goroutine.
+/// Per-second XDP stats logging + metrics, mirroring the Go goroutine, plus the
+/// L4-flood detection state machine that drives Discord alerts.
 #[cfg(all(target_os = "linux", feature = "xdp"))]
-fn spawn_xdp_stats(blocker: Arc<dyn xdp::Blocker>, cfg: Arc<Config>) {
+fn spawn_xdp_stats(
+    blocker: Arc<dyn xdp::Blocker>,
+    cfg: Arc<Config>,
+    alerter: Option<Arc<discord::DiscordAlerter>>,
+) {
+    use crate::discord::{L4Event, L4Reasons};
+
+    // Seconds between progress updates while a flood is ongoing.
+    const L4_UPDATE_INTERVAL: i64 = 180;
+    // Minimum gap between successive flood-start alerts (avoids flap-spam).
+    const L4_INITIAL_COOLDOWN: i64 = 60;
+    // Consecutive sub-threshold seconds required before declaring all-clear.
+    const L4_CLEAR_GRACE: u32 = 5;
+
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(1));
-        let (mut prev_allowed, mut prev_blocked) = match blocker.get_stats() {
-            Ok(s) => (s.allowed, s.blocked),
-            Err(_) => (0, 0),
-        };
+        let mut prev = blocker.get_stats().unwrap_or_default();
+
+        let threshold = cfg.xdp_alert_pps;
+        let l4_enabled = alerter.is_some() && threshold > 0;
+        let mut l4_active = false;
+        let mut l4_started_at: i64 = 0;
+        let mut l4_last_sent_at: i64 = 0;
+        let mut l4_peak_pps: u64 = 0;
+        let mut below_count: u32 = 0;
+
+        // Saturating per-second delta that tolerates counter resets/wraps.
+        let delta = |cur: u64, prev: u64| if cur >= prev { cur - prev } else { cur };
+
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            match blocker.get_stats() {
-                Ok(stats) => {
-                    let delta_allowed = if stats.allowed >= prev_allowed {
-                        stats.allowed - prev_allowed
-                    } else {
-                        stats.allowed
-                    };
-                    let delta_blocked = if stats.blocked >= prev_blocked {
-                        stats.blocked - prev_blocked
-                    } else {
-                        stats.blocked
-                    };
-                    if delta_allowed > 0 || delta_blocked > 0 {
-                        tracing::info!(allowed = delta_allowed, blocked = delta_blocked, "XDP Stats (per sec)");
-                    }
-                    if cfg.prometheus_enabled {
-                        if delta_allowed > 0 {
-                            metrics::XDP_PACKETS
-                                .with_label_values(&["allowed"])
-                                .inc_by(delta_allowed);
-                        }
-                        if delta_blocked > 0 {
-                            metrics::XDP_PACKETS
-                                .with_label_values(&["blocked"])
-                                .inc_by(delta_blocked);
-                        }
-                    }
-                    prev_allowed = stats.allowed;
-                    prev_blocked = stats.blocked;
-                }
+            let stats = match blocker.get_stats() {
+                Ok(s) => s,
                 Err(e) => {
                     tracing::error!(error = %e, "Failed to get XDP stats");
+                    continue;
+                }
+            };
+
+            let delta_allowed = delta(stats.allowed, prev.allowed);
+            let delta_blocked = delta(stats.blocked, prev.blocked);
+            let reasons = L4Reasons {
+                blocklist: delta(stats.drop_blocklist, prev.drop_blocklist),
+                udp: delta(stats.drop_udp, prev.drop_udp),
+                tcp_malformed: delta(stats.drop_tcp_malformed, prev.drop_tcp_malformed),
+                http_invalid: delta(stats.drop_http_invalid, prev.drop_http_invalid),
+                tls_invalid: delta(stats.drop_tls_invalid, prev.drop_tls_invalid),
+            };
+
+            if delta_allowed > 0 || delta_blocked > 0 {
+                tracing::info!(allowed = delta_allowed, blocked = delta_blocked, "XDP Stats (per sec)");
+            }
+
+            if cfg.prometheus_enabled {
+                if delta_allowed > 0 {
+                    metrics::XDP_PACKETS.with_label_values(&["allowed"]).inc_by(delta_allowed);
+                }
+                if delta_blocked > 0 {
+                    metrics::XDP_PACKETS.with_label_values(&["blocked"]).inc_by(delta_blocked);
+                }
+                for (reason, n) in [
+                    ("blocklist", reasons.blocklist),
+                    ("udp", reasons.udp),
+                    ("tcp_malformed", reasons.tcp_malformed),
+                    ("http_invalid", reasons.http_invalid),
+                    ("tls_invalid", reasons.tls_invalid),
+                ] {
+                    if n > 0 {
+                        metrics::XDP_DROPS.with_label_values(&[reason]).inc_by(n);
+                    }
                 }
             }
+
+            // ── L4 flood alert state machine ──────────────────────────────────
+            if l4_enabled {
+                let pps = delta_blocked;
+                let now = unix_secs();
+                if pps >= threshold as u64 {
+                    below_count = 0;
+                    if pps > l4_peak_pps {
+                        l4_peak_pps = pps;
+                    }
+                    if !l4_active {
+                        if now - l4_last_sent_at >= L4_INITIAL_COOLDOWN {
+                            l4_active = true;
+                            l4_started_at = now;
+                            l4_last_sent_at = now;
+                            let fps = blocker.top_fingerprints(3).unwrap_or_default();
+                            if let Some(a) = &alerter {
+                                a.notify_l4(L4Event::Start, pps, l4_peak_pps, reasons, fps).await;
+                            }
+                        }
+                    } else if now - l4_last_sent_at >= L4_UPDATE_INTERVAL {
+                        l4_last_sent_at = now;
+                        let fps = blocker.top_fingerprints(3).unwrap_or_default();
+                        if let Some(a) = &alerter {
+                            a.notify_l4(L4Event::Update, pps, l4_peak_pps, reasons, fps).await;
+                        }
+                    }
+                } else if l4_active {
+                    below_count += 1;
+                    if below_count >= L4_CLEAR_GRACE {
+                        let duration_secs = now - l4_started_at;
+                        if let Some(a) = &alerter {
+                            a.notify_l4(
+                                L4Event::Clear { duration_secs },
+                                pps,
+                                l4_peak_pps,
+                                reasons,
+                                Vec::new(),
+                            )
+                            .await;
+                        }
+                        let _ = blocker.clear_fingerprints();
+                        l4_active = false;
+                        l4_last_sent_at = now;
+                        l4_peak_pps = 0;
+                        below_count = 0;
+                    }
+                }
+            }
+
+            prev = stats;
         }
     });
+}
+
+/// Current Unix time in seconds.
+#[cfg(all(target_os = "linux", feature = "xdp"))]
+fn unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }

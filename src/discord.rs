@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 
 use crate::limiter::RateLimiter;
 use crate::metrics;
+use crate::xdp::Fingerprint;
 
 /// Burst threshold: only alert when req/s exceeds 500 req/min (~8.3 req/s).
 pub const ALERT_THRESHOLD_RPS: i64 = 9;
@@ -234,6 +235,198 @@ impl DiscordAlerter {
             }
         }
     }
+
+    /// Send an L4 (XDP layer) flood alert. Driven by the per-second XDP stats
+    /// loop, which owns the detection state machine; this method only classifies
+    /// the attack from the per-reason drop breakdown, renders the captured byte
+    /// fingerprint, and posts the appropriate embed.
+    ///
+    /// `reasons` are the per-second *deltas* of each drop category, `pps`/`peak`
+    /// are dropped packets-per-second, and `fingerprints` are the top recurring
+    /// dropped-payload signatures (highest count first).
+    pub async fn notify_l4(
+        &self,
+        event: L4Event,
+        pps: u64,
+        peak_pps: u64,
+        reasons: L4Reasons,
+        fingerprints: Vec<Fingerprint>,
+    ) {
+        let payload = match event {
+            L4Event::Start => build_l4_initial(pps, peak_pps, &reasons, &fingerprints),
+            L4Event::Update => build_l4_update(pps, peak_pps, &reasons, &fingerprints),
+            L4Event::Clear { duration_secs } => {
+                build_l4_clear(peak_pps, duration_secs, &reasons)
+            }
+        };
+        match self.client.post(&self.webhook_url).json(&payload).send().await {
+            Ok(_) => tracing::info!(pps, peak_pps, "Sent Discord L4/XDP flood alert"),
+            Err(e) => tracing::warn!(error = %e, "Failed to send Discord L4/XDP flood alert"),
+        }
+    }
+}
+
+// ─── L4 / XDP flood alerting ──────────────────────────────────────────────────
+
+/// Which point in the L4-flood lifecycle an alert represents.
+pub enum L4Event {
+    /// First detection — packets/sec crossed the alert threshold.
+    Start,
+    /// Periodic update while the flood is still in progress.
+    Update,
+    /// Flood subsided — dropped rate fell back below the threshold.
+    Clear { duration_secs: i64 },
+}
+
+/// Per-second deltas of each XDP drop category, used to classify the attack.
+#[derive(Clone, Copy, Default)]
+pub struct L4Reasons {
+    pub blocklist: u64,
+    pub udp: u64,
+    pub tcp_malformed: u64,
+    pub http_invalid: u64,
+    pub tls_invalid: u64,
+}
+
+/// Pick the dominant drop category and return a (short label, description) pair.
+fn classify_l4(r: &L4Reasons) -> (&'static str, &'static str) {
+    let candidates = [
+        (
+            r.udp,
+            "UDP flood",
+            "High volume of UDP packets to ports 80/443 — dropped wholesale at L4 (the proxy serves no UDP).",
+        ),
+        (
+            r.http_invalid,
+            "Non-HTTP junk flood (:80)",
+            "TCP payloads to :80 whose first bytes are not a valid HTTP request line — raw garbage/replay flood.",
+        ),
+        (
+            r.tls_invalid,
+            "Non-TLS junk flood (:443)",
+            "TCP payloads to :443 that are not a TLS ClientHello — malformed/replayed TLS flood.",
+        ),
+        (
+            r.tcp_malformed,
+            "Malformed-TCP flood",
+            "Truncated or malformed TCP segments — crafted packets / spoofed-header flood.",
+        ),
+        (
+            r.blocklist,
+            "Blocklisted-IP flood",
+            "Packets from source IPs already on the XDP blocklist (repeat offenders).",
+        ),
+    ];
+    let mut best: (u64, &'static str, &'static str) = (
+        0,
+        "Mixed L4 flood",
+        "Multiple drop categories with no single dominant type.",
+    );
+    for c in candidates {
+        if c.0 > best.0 {
+            best = c;
+        }
+    }
+    (best.1, best.2)
+}
+
+/// Render the top dropped-payload fingerprints as hex + printable-ASCII so the
+/// operator can see the literal bytes being replayed. Bounded to fit a Discord
+/// embed field (1024 chars).
+fn render_fingerprints(fps: &[Fingerprint]) -> String {
+    if fps.is_empty() {
+        return "_No payload sample captured — likely a header-only / volumetric flood (e.g. SYN or spoofed packets)._".to_string();
+    }
+    let mut out = String::new();
+    for (i, fp) in fps.iter().take(3).enumerate() {
+        let hex = fp
+            .bytes
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let ascii: String = fp
+            .bytes
+            .iter()
+            .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+            .collect();
+        out.push_str(&format!(
+            "**#{}** ×`{}`\nhex `{hex}`\ntxt `{ascii}`\n",
+            i + 1,
+            fp.count,
+        ));
+    }
+    out
+}
+
+fn l4_breakdown(r: &L4Reasons) -> String {
+    format!(
+        "UDP `{}` • :80 junk `{}` • :443 junk `{}` • bad-TCP `{}` • blocklist `{}`",
+        r.udp, r.http_invalid, r.tls_invalid, r.tcp_malformed, r.blocklist
+    )
+}
+
+fn build_l4_initial(pps: u64, peak: u64, reasons: &L4Reasons, fps: &[Fingerprint]) -> Value {
+    let (label, desc) = classify_l4(reasons);
+    json!({
+        "embeds": [{
+            "title": "🛑 L4 Flood Detected (XDP)",
+            "description": format!(
+                "The XDP layer is dropping **`{pps}` packets/sec**.\nSuspected attack type: **{label}** — {desc}"
+            ),
+            "color": 0x992D22,
+            "fields": [
+                { "name": "📦 Dropped pkt/s",     "value": format!("`{pps}` pkt/s"),  "inline": true },
+                { "name": "🔺 Peak dropped pkt/s", "value": format!("`{peak}` pkt/s"), "inline": true },
+                { "name": "🧬 Drop breakdown (last sec)", "value": l4_breakdown(reasons), "inline": false },
+                { "name": "🔎 Payload fingerprint", "value": render_fingerprints(fps), "inline": false }
+            ],
+            "footer": { "text": "ddos-proxy  •  L4/XDP layer  •  flood started" },
+            "timestamp": iso8601_now()
+        }]
+    })
+}
+
+fn build_l4_update(pps: u64, peak: u64, reasons: &L4Reasons, fps: &[Fingerprint]) -> Value {
+    let (label, desc) = classify_l4(reasons);
+    json!({
+        "embeds": [{
+            "title": "⚠️ L4 Flood — Update",
+            "description": format!(
+                "XDP is still dropping **`{pps}` packets/sec**.\nDominant type: **{label}** — {desc}"
+            ),
+            "color": 0xE67E22,
+            "fields": [
+                { "name": "📦 Dropped pkt/s",     "value": format!("`{pps}` pkt/s"),  "inline": true },
+                { "name": "🔺 Peak dropped pkt/s", "value": format!("`{peak}` pkt/s"), "inline": true },
+                { "name": "🧬 Drop breakdown (last sec)", "value": l4_breakdown(reasons), "inline": false },
+                { "name": "🔎 Payload fingerprint", "value": render_fingerprints(fps), "inline": false }
+            ],
+            "footer": { "text": "ddos-proxy  •  L4/XDP layer  •  flood ongoing" },
+            "timestamp": iso8601_now()
+        }]
+    })
+}
+
+fn build_l4_clear(peak: u64, duration_secs: i64, reasons: &L4Reasons) -> Value {
+    let duration_str = format_duration(duration_secs);
+    let (label, _) = classify_l4(reasons);
+    json!({
+        "embeds": [{
+            "title": "✅ L4 Flood Subsided (XDP)",
+            "description": format!(
+                "Dropped-packet rate fell back below the alert threshold after {duration_str}. \
+                 Last dominant type: **{label}**."
+            ),
+            "color": 0x2ECC71,
+            "fields": [
+                { "name": "⏱️ Flood Duration",      "value": format!("`{duration_str}`"),  "inline": true },
+                { "name": "🔺 Peak dropped pkt/s",   "value": format!("`{peak}` pkt/s"),    "inline": true }
+            ],
+            "footer": { "text": "ddos-proxy  •  L4/XDP layer  •  flood resolved" },
+            "timestamp": iso8601_now()
+        }]
+    })
 }
 
 // ─── HTTP send helper ────────────────────────────────────────────────────────
