@@ -289,10 +289,14 @@ fn spawn_xdp_stats(
 
     // Seconds between progress updates while a flood is ongoing.
     const L4_UPDATE_INTERVAL: i64 = 180;
-    // Minimum gap between successive flood-start alerts (avoids flap-spam).
-    const L4_INITIAL_COOLDOWN: i64 = 60;
+    // Minimum seconds between two successive Start alerts. Applies both to the
+    // initial Start and to any re-Start after an all-clear, preventing flap-spam
+    // when an attack is intermittent (burst/pause/burst pattern).
+    const L4_INITIAL_COOLDOWN: i64 = 300; // 5 minutes
     // Consecutive sub-threshold seconds required before declaring all-clear.
-    const L4_CLEAR_GRACE: u32 = 5;
+    // Longer grace means brief pauses in an ongoing attack don't trigger a
+    // premature Clear → Start cycle.
+    const L4_CLEAR_GRACE: u32 = 10;
 
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_secs(1));

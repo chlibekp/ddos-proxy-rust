@@ -17,8 +17,10 @@ const UPDATE_INTERVAL_SECS: u64 = 180; // 3 minutes
 /// Seconds to wait after the first trigger before reading "real" req/s for the initial alert.
 const WARMUP_SECS: u64 = 5;
 
-/// Minimum gap between initial alerts for back-to-back mitigation windows.
-const INITIAL_COOLDOWN_SECS: i64 = 60;
+/// Minimum gap between two successive initial alerts (Start embeds).
+/// Applies after both a fresh start and after an all-clear, so a burst/pause/burst
+/// pattern doesn't generate a Start→Clear→Start→Clear spam cycle.
+const INITIAL_COOLDOWN_SECS: i64 = 300; // 5 minutes
 
 /// Snapshot of stats captured at the time of the last Discord message.
 #[derive(Clone)]
