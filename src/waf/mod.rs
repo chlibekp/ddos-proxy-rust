@@ -31,7 +31,8 @@ pub struct Manager {
     xdp: Option<Arc<dyn Blocker>>,
     proxy: Arc<Proxy>,
     alerter: Option<Arc<DiscordAlerter>>,
-    mitigation_until: AtomicI64, // unix seconds
+    mitigation_until: AtomicI64,   // unix seconds
+    mitigation_started_at: AtomicI64, // unix seconds; when the current mitigation window began
     js_challenge_until: AtomicI64, // unix seconds; while set, escalate cookie→JS challenge
     timeout_count: AtomicI64,
     ip_states: DashMap<String, Arc<ClientState>>,
@@ -59,6 +60,7 @@ impl Manager {
             proxy,
             alerter,
             mitigation_until: AtomicI64::new(0),
+            mitigation_started_at: AtomicI64::new(0),
             js_challenge_until: AtomicI64::new(0),
             timeout_count: AtomicI64::new(0),
             ip_states: DashMap::new(),
@@ -521,13 +523,24 @@ impl Manager {
         let mut should_serve_challenge = self.cfg.always_on || per_ip_over_limit;
 
         if req_rate >= self.cfg.max_req_per_sec || conn_rate >= self.cfg.max_conn_per_sec {
-            // If we were already in a mitigation window, the rate is still being
-            // breached despite the cookie challenge being served — i.e. the attack
-            // is solving the cookie challenge and bypassing it. Escalate every
-            // client to the heavier JS (PoW/Turnstile) challenge.
-            if self.cfg.cookie_challenge && now_s < mitigation_until {
-                self.js_challenge_until
-                    .store(now_s + mitigation_secs, Ordering::SeqCst);
+            let already_mitigating = now_s < mitigation_until;
+            if already_mitigating {
+                // Still under attack while mitigation is active. Escalate to JS
+                // challenge only after the cookie challenge has had 30 seconds to
+                // filter the attack — if the attack is still bypassing after that
+                // window, the cookie challenge isn't enough.
+                let started_at = self.mitigation_started_at.load(Ordering::SeqCst);
+                if self.cfg.cookie_challenge && now_s >= started_at + 30 {
+                    self.js_challenge_until
+                        .store(now_s + mitigation_secs, Ordering::SeqCst);
+                    tracing::info!("DDoS attack bypassing cookie challenge after 30s; escalating to JS challenge");
+                }
+            } else {
+                // New mitigation window — start with cookie challenge.
+                self.mitigation_started_at.store(now_s, Ordering::SeqCst);
+                // Clear any leftover JS-challenge window from a previous attack.
+                self.js_challenge_until.store(0, Ordering::SeqCst);
+                tracing::info!("DDoS mitigation started; serving cookie challenge");
             }
             self.mitigation_until
                 .store(now_s + mitigation_secs, Ordering::SeqCst);
@@ -856,6 +869,7 @@ pub struct StateInfo {
 pub struct MitigationStatus {
     pub mitigation_active: bool,
     pub mitigation_until_unix: i64,
+    pub mitigation_started_at_unix: i64,
     pub js_challenge_active: bool,
     pub js_challenge_until_unix: i64,
     pub ip_state_count: i64,
@@ -911,6 +925,7 @@ impl Manager {
         MitigationStatus {
             mitigation_active: now_s < mitigation_until,
             mitigation_until_unix: mitigation_until,
+            mitigation_started_at_unix: self.mitigation_started_at.load(Ordering::SeqCst),
             js_challenge_active: now_s < js_challenge_until,
             js_challenge_until_unix: js_challenge_until,
             ip_state_count: self.ip_state_count.load(Ordering::SeqCst),
