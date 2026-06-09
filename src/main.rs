@@ -323,11 +323,16 @@ fn spawn_xdp_stats(
             let delta_allowed = delta(stats.allowed, prev.allowed);
             let delta_blocked = delta(stats.blocked, prev.blocked);
             let reasons = L4Reasons {
-                blocklist: delta(stats.drop_blocklist, prev.drop_blocklist),
-                udp: delta(stats.drop_udp, prev.drop_udp),
-                tcp_malformed: delta(stats.drop_tcp_malformed, prev.drop_tcp_malformed),
-                http_invalid: delta(stats.drop_http_invalid, prev.drop_http_invalid),
-                tls_invalid: delta(stats.drop_tls_invalid, prev.drop_tls_invalid),
+                blocklist:    delta(stats.drop_blocklist,     prev.drop_blocklist),
+                udp:          delta(stats.drop_udp,           prev.drop_udp),
+                tcp_malformed:delta(stats.drop_tcp_malformed, prev.drop_tcp_malformed),
+                http_invalid: delta(stats.drop_http_invalid,  prev.drop_http_invalid),
+                tls_invalid:  delta(stats.drop_tls_invalid,   prev.drop_tls_invalid),
+                icmp:         delta(stats.drop_icmp,          prev.drop_icmp),
+                bad_flags:    delta(stats.drop_bad_flags,     prev.drop_bad_flags),
+                fragment:     delta(stats.drop_fragment,      prev.drop_fragment),
+                amplify:      delta(stats.drop_amplify,       prev.drop_amplify),
+                syn_flood:    delta(stats.drop_syn_flood,     prev.drop_syn_flood),
             };
 
             if delta_allowed > 0 || delta_blocked > 0 {
@@ -342,11 +347,16 @@ fn spawn_xdp_stats(
                     metrics::XDP_PACKETS.with_label_values(&["blocked"]).inc_by(delta_blocked);
                 }
                 for (reason, n) in [
-                    ("blocklist", reasons.blocklist),
-                    ("udp", reasons.udp),
+                    ("blocklist",     reasons.blocklist),
+                    ("udp",           reasons.udp),
                     ("tcp_malformed", reasons.tcp_malformed),
-                    ("http_invalid", reasons.http_invalid),
-                    ("tls_invalid", reasons.tls_invalid),
+                    ("http_invalid",  reasons.http_invalid),
+                    ("tls_invalid",   reasons.tls_invalid),
+                    ("icmp",          reasons.icmp),
+                    ("bad_flags",     reasons.bad_flags),
+                    ("fragment",      reasons.fragment),
+                    ("amplify",       reasons.amplify),
+                    ("syn_flood",     reasons.syn_flood),
                 ] {
                     if n > 0 {
                         metrics::XDP_DROPS.with_label_values(&[reason]).inc_by(n);
@@ -355,8 +365,17 @@ fn spawn_xdp_stats(
             }
 
             // ── L4 flood alert state machine ──────────────────────────────────
+            let pps = delta_blocked;
+            let (dominant_type, _) = discord::classify_l4_reasons(&reasons);
+
+            if cfg.prometheus_enabled {
+                metrics::xdp_l4_flood_state(
+                    if l4_active { Some(dominant_type) } else { None },
+                    pps as i64,
+                );
+            }
+
             if l4_enabled {
-                let pps = delta_blocked;
                 let now = unix_secs();
                 if pps >= threshold as u64 {
                     below_count = 0;
