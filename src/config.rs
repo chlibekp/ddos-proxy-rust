@@ -59,6 +59,12 @@ pub struct Config {
     /// 60-second window before the endpoint returns 429.  Default: 5.
     /// Set via `PROXY_MAX_VERIFY_ATTEMPTS`.
     pub max_verify_attempts: i64,
+
+    /// Dropped-packets-per-second threshold (measured at the XDP/L4 layer) above
+    /// which a Discord L4-flood alert is fired. `<= 0` disables L4 alerting.
+    /// Default: 1000. Set via `PROXY_XDP_ALERT_PPS`. Only meaningful when both
+    /// `PROXY_XDP_INTERFACE` and `PROXY_DISCORD_WEBHOOK_URL` are configured.
+    pub xdp_alert_pps: i64,
 }
 
 /// Error returned when required configuration is missing.
@@ -204,6 +210,10 @@ impl Config {
             .filter(|&v| v > 0)
             .unwrap_or(5);
 
+        let xdp_alert_pps = env_nonempty("PROXY_XDP_ALERT_PPS")
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(1000);
+
         Ok(Config {
             backend_url,
             port,
@@ -243,6 +253,7 @@ impl Config {
             healthz_backend_path,
             discord_webhook_url,
             max_verify_attempts,
+            xdp_alert_pps,
         })
     }
 }

@@ -467,6 +467,7 @@ mod tests {
             healthz_backend_path: "/".to_string(),
             discord_webhook_url: None,
             max_verify_attempts: 5,
+            xdp_alert_pps: 1000,
         });
         let rl = Arc::new(RateLimiter::new());
         let target: http::Uri = "http://127.0.0.1:8081".parse().unwrap();

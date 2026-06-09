@@ -50,9 +50,17 @@ struct {
     __type(value, __u8);
 } allowed_flows SEC(".maps");
 
+// Per-packet statistics. `allowed`/`blocked` are the running totals (unchanged
+// from the original program); the `drop_*` fields break the blocked total down
+// by *why* the packet was dropped, so userspace can classify the attack type.
 struct stats {
     __u64 allowed;
     __u64 blocked;
+    __u64 drop_blocklist;     // source IP is on the XDP blocklist
+    __u64 drop_udp;           // UDP to a service port (UDP flood) / malformed UDP
+    __u64 drop_tcp_malformed; // truncated / malformed TCP segment
+    __u64 drop_http_invalid;  // :80 payload that is not a valid HTTP request line
+    __u64 drop_tls_invalid;   // :443 payload that is not a TLS ClientHello
 };
 
 struct {
@@ -62,12 +70,80 @@ struct {
     __type(value, struct stats);
 } xdp_stats SEC(".maps");
 
+// Drop reason codes (kept in sync with the per-reason fields above).
+#define DROP_BLOCKLIST     0
+#define DROP_UDP           1
+#define DROP_TCP_MALFORMED 2
+#define DROP_HTTP_INVALID  3
+#define DROP_TLS_INVALID   4
+
+// ── Attack fingerprinting ────────────────────────────────────────────────────
+// A "fingerprint" is a hash of the first FP_SAMPLE_LEN bytes of a dropped
+// packet's payload, together with a copy of those bytes and an occurrence
+// counter. Floods tend to replay an identical (or near-identical) payload, so
+// the highest-count fingerprint is the signature of the current attack. The map
+// is an LRU hash so one-off junk can't exhaust it during a real flood.
+#define FP_SAMPLE_LEN 16
+
+struct fingerprint {
+    __u64 count;
+    __u32 len;                 // number of valid bytes captured (<= FP_SAMPLE_LEN)
+    __u8  bytes[FP_SAMPLE_LEN];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 1024);
+    __type(key, __u32);
+    __type(value, struct fingerprint);
+} fingerprints SEC(".maps");
+
 static __always_inline void count_allowed(struct stats *st) {
     if (st) __sync_fetch_and_add(&st->allowed, 1);
 }
 
-static __always_inline void count_blocked(struct stats *st) {
-    if (st) __sync_fetch_and_add(&st->blocked, 1);
+// Increment the total blocked counter plus the per-reason breakdown.
+static __always_inline void count_drop(struct stats *st, int reason) {
+    if (!st) return;
+    __sync_fetch_and_add(&st->blocked, 1);
+    switch (reason) {
+        case DROP_BLOCKLIST:     __sync_fetch_and_add(&st->drop_blocklist, 1);     break;
+        case DROP_UDP:           __sync_fetch_and_add(&st->drop_udp, 1);           break;
+        case DROP_TCP_MALFORMED: __sync_fetch_and_add(&st->drop_tcp_malformed, 1); break;
+        case DROP_HTTP_INVALID:  __sync_fetch_and_add(&st->drop_http_invalid, 1);  break;
+        case DROP_TLS_INVALID:   __sync_fetch_and_add(&st->drop_tls_invalid, 1);   break;
+    }
+}
+
+// Sample the first FP_SAMPLE_LEN bytes of a dropped payload, FNV-1a hash them,
+// and bump (or insert) the matching fingerprint entry. Safe to call even when
+// no payload is present — the bounds check breaks out and nothing is recorded.
+static __always_inline void record_fingerprint(unsigned char *payload, void *data_end) {
+    struct fingerprint fp = {};
+    __u32 hash = 2166136261u; // FNV-1a 32-bit offset basis
+    __u32 n = 0;
+
+#pragma unroll
+    for (int i = 0; i < FP_SAMPLE_LEN; i++) {
+        if ((void *)(payload + i + 1) > data_end)
+            break;
+        __u8 b = payload[i];
+        fp.bytes[i] = b;
+        hash = (hash ^ (__u32)b) * 16777619u; // FNV-1a prime
+        n++;
+    }
+
+    if (n == 0)
+        return;
+
+    struct fingerprint *existing = bpf_map_lookup_elem(&fingerprints, &hash);
+    if (existing) {
+        __sync_fetch_and_add(&existing->count, 1);
+    } else {
+        fp.count = 1;
+        fp.len = n;
+        bpf_map_update_elem(&fingerprints, &hash, &fp, BPF_ANY);
+    }
 }
 
 static __always_inline int is_http_request(unsigned char *payload, void *data_end) {
@@ -190,19 +266,21 @@ int xdp_drop_func(struct xdp_md *ctx) {
     __u32 src_ip = ip->saddr;
     __u8 *blocked = bpf_map_lookup_elem(&blocklist, &src_ip);
     if (blocked) {
-        count_blocked(st);
+        count_drop(st, DROP_BLOCKLIST);
         return XDP_DROP;
     }
 
     if (ip->protocol == IPPROTO_UDP) {
         struct udphdr *udp = data + sizeof(*eth) + ((__u32)ip->ihl * 4);
         if ((void *)(udp + 1) > data_end) {
-            count_blocked(st);
+            count_drop(st, DROP_UDP);
             return XDP_DROP;
         }
 
         if (is_service_port(udp->dest)) {
-            count_blocked(st);
+            // UDP floods commonly replay an identical payload — fingerprint it.
+            record_fingerprint((unsigned char *)(udp + 1), data_end);
+            count_drop(st, DROP_UDP);
             return XDP_DROP;
         }
 
@@ -217,25 +295,25 @@ int xdp_drop_func(struct xdp_md *ctx) {
 
     __u32 ip_hdr_len = (__u32)ip->ihl * 4;
     if (ip_hdr_len < sizeof(*ip)) {
-        count_blocked(st);
+        count_drop(st, DROP_TCP_MALFORMED);
         return XDP_DROP;
     }
 
     struct tcphdr *tcp = data + sizeof(*eth) + ip_hdr_len;
     if ((void *)(tcp + 1) > data_end) {
-        count_blocked(st);
+        count_drop(st, DROP_TCP_MALFORMED);
         return XDP_DROP;
     }
 
     __u32 tcp_hdr_len = (__u32)tcp->doff * 4;
     if (tcp_hdr_len < sizeof(*tcp)) {
-        count_blocked(st);
+        count_drop(st, DROP_TCP_MALFORMED);
         return XDP_DROP;
     }
 
     unsigned char *payload = (unsigned char *)tcp + tcp_hdr_len;
     if ((void *)payload > data_end) {
-        count_blocked(st);
+        count_drop(st, DROP_TCP_MALFORMED);
         return XDP_DROP;
     }
 
@@ -279,7 +357,16 @@ int xdp_drop_func(struct xdp_md *ctx) {
         return XDP_PASS;
     }
 
-    count_blocked(st);
+    // Payload-bearing junk on a service port: capture the signature and drop,
+    // classifying by which service port it targeted.
+    record_fingerprint(payload, data_end);
+    if (tcp->dest == bpf_htons(80)) {
+        count_drop(st, DROP_HTTP_INVALID);
+    } else if (tcp->dest == bpf_htons(443)) {
+        count_drop(st, DROP_TLS_INVALID);
+    } else {
+        count_drop(st, DROP_TCP_MALFORMED);
+    }
     return XDP_DROP;
 }
 

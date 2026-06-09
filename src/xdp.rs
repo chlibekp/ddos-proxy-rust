@@ -10,10 +10,33 @@
 //! block/unblock calls do nothing (matching the Go behaviour when
 //! `PROXY_XDP_INTERFACE` is unset).
 
+/// Number of leading payload bytes captured per fingerprint. Must match
+/// `FP_SAMPLE_LEN` in `src/bpf/xdp.c`.
+#[allow(dead_code)] // only read by the Linux+xdp implementation
+pub const FP_SAMPLE_LEN: usize = 16;
+
 #[derive(Clone, Copy, Default, Debug)]
 pub struct Stats {
     pub allowed: u64,
     pub blocked: u64,
+    /// Per-reason breakdown of the `blocked` total (see `src/bpf/xdp.c`).
+    pub drop_blocklist: u64,
+    pub drop_udp: u64,
+    pub drop_tcp_malformed: u64,
+    pub drop_http_invalid: u64,
+    pub drop_tls_invalid: u64,
+}
+
+/// A captured byte signature of repeatedly-dropped packets: the first
+/// [`FP_SAMPLE_LEN`] bytes of the payload and how often that pattern was seen.
+#[derive(Clone, Debug)]
+pub struct Fingerprint {
+    /// FNV-1a hash of the sampled bytes (the map key).
+    pub hash: u32,
+    /// How many dropped packets carried this exact byte prefix.
+    pub count: u64,
+    /// The captured leading bytes (up to [`FP_SAMPLE_LEN`]).
+    pub bytes: Vec<u8>,
 }
 
 /// Interface for an IP blocker (like XDP).
@@ -21,6 +44,12 @@ pub trait Blocker: Send + Sync {
     fn block_ip(&self, ip: &str) -> Result<(), String>;
     fn unblock_ip(&self, ip: &str) -> Result<(), String>;
     fn get_stats(&self) -> Result<Stats, String>;
+    /// Return the most frequently-seen dropped-payload fingerprints, highest
+    /// count first, capped at `n`.
+    fn top_fingerprints(&self, n: usize) -> Result<Vec<Fingerprint>, String>;
+    /// Drop all recorded fingerprints (called when an attack window ends so the
+    /// next attack starts with a clean signature set).
+    fn clear_fingerprints(&self) -> Result<(), String>;
 }
 
 /// Convert a dotted IPv4 string into the u32 key used by the eBPF blocklist map.
@@ -35,7 +64,7 @@ fn ipv4_key(ip: &str) -> Option<u32> {
 // ── Linux + feature `xdp`: real aya-backed implementation ────────────────────
 #[cfg(all(target_os = "linux", feature = "xdp"))]
 mod imp {
-    use super::{ipv4_key, Blocker, Stats};
+    use super::{ipv4_key, Blocker, Fingerprint, Stats, FP_SAMPLE_LEN};
     use aya::maps::{Array, HashMap as AyaHashMap};
     use aya::programs::{Xdp, XdpFlags};
     use aya::Ebpf;
@@ -49,8 +78,24 @@ mod imp {
     struct BpfStats {
         allowed: u64,
         blocked: u64,
+        drop_blocklist: u64,
+        drop_udp: u64,
+        drop_tcp_malformed: u64,
+        drop_http_invalid: u64,
+        drop_tls_invalid: u64,
     }
     unsafe impl aya::Pod for BpfStats {}
+
+    // Layout must match `struct fingerprint` in src/bpf/xdp.c:
+    //   __u64 count; __u32 len; __u8 bytes[16];  (size 32, align 8)
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct BpfFingerprint {
+        count: u64,
+        len: u32,
+        bytes: [u8; FP_SAMPLE_LEN],
+    }
+    unsafe impl aya::Pod for BpfFingerprint {}
 
     pub struct XdpBlocker {
         ebpf: Mutex<Ebpf>,
@@ -102,7 +147,47 @@ mod imp {
             Ok(Stats {
                 allowed: s.allowed,
                 blocked: s.blocked,
+                drop_blocklist: s.drop_blocklist,
+                drop_udp: s.drop_udp,
+                drop_tcp_malformed: s.drop_tcp_malformed,
+                drop_http_invalid: s.drop_http_invalid,
+                drop_tls_invalid: s.drop_tls_invalid,
             })
+        }
+
+        fn top_fingerprints(&self, n: usize) -> Result<Vec<Fingerprint>, String> {
+            let ebpf = self.ebpf.lock().unwrap();
+            let map: AyaHashMap<_, u32, BpfFingerprint> = AyaHashMap::try_from(
+                ebpf.map("fingerprints").ok_or("fingerprints map missing")?,
+            )
+            .map_err(|e| e.to_string())?;
+
+            let mut out: Vec<Fingerprint> = Vec::new();
+            for entry in map.iter() {
+                let (hash, fp) = entry.map_err(|e| e.to_string())?;
+                let len = (fp.len as usize).min(FP_SAMPLE_LEN);
+                out.push(Fingerprint {
+                    hash,
+                    count: fp.count,
+                    bytes: fp.bytes[..len].to_vec(),
+                });
+            }
+            out.sort_by(|a, b| b.count.cmp(&a.count));
+            out.truncate(n);
+            Ok(out)
+        }
+
+        fn clear_fingerprints(&self) -> Result<(), String> {
+            let mut ebpf = self.ebpf.lock().unwrap();
+            let mut map: AyaHashMap<_, u32, BpfFingerprint> = AyaHashMap::try_from(
+                ebpf.map_mut("fingerprints").ok_or("fingerprints map missing")?,
+            )
+            .map_err(|e| e.to_string())?;
+            let keys: Vec<u32> = map.keys().filter_map(|k| k.ok()).collect();
+            for k in keys {
+                let _ = map.remove(&k);
+            }
+            Ok(())
         }
     }
 
@@ -136,5 +221,11 @@ impl Blocker for NoopBlocker {
     }
     fn get_stats(&self) -> Result<Stats, String> {
         Ok(Stats::default())
+    }
+    fn top_fingerprints(&self, _n: usize) -> Result<Vec<Fingerprint>, String> {
+        Ok(Vec::new())
+    }
+    fn clear_fingerprints(&self) -> Result<(), String> {
+        Ok(())
     }
 }

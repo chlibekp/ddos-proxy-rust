@@ -56,6 +56,7 @@ The proxy is configured via environment variables.
 | `PROXY_ACME_EAB_HMAC` | `""` | External Account Binding HMAC key (base64 or base64url). |
 | `PROXY_HTTP_PORT` | `80` | Port for the HTTP→HTTPS redirect server and ACME HTTP-01 challenges (SSL only). |
 | `PROXY_XDP_INTERFACE` | `""` | Network interface to attach the XDP program to (e.g. `eth0`). Requires the `xdp` build feature plus `NET_ADMIN`, `SYS_ADMIN`, `BPF` capabilities. |
+| `PROXY_XDP_ALERT_PPS` | `1000` | Dropped-packets-per-second threshold (measured at the XDP/L4 layer) above which a Discord **L4-flood** alert fires. `0` or less disables L4 alerting. Only active when both `PROXY_XDP_INTERFACE` and `PROXY_DISCORD_WEBHOOK_URL` are set. |
 | `PROXY_MAX_IP_STATES` | `500000` | Cap on tracked client IP states (0 = unlimited) to bound memory under spoofed floods. |
 | `PROXY_DISCORD_WEBHOOK_URL` | `""` | Discord incoming-webhook URL. When set, a rich embed is posted to this channel whenever mitigation mode is triggered by sustained traffic exceeding **500 req/min** (~8.3 req/s). Alerts are rate-limited to at most **one per minute** to prevent webhook spam. Leave empty to disable. |
 
@@ -153,6 +154,36 @@ Short traffic bursts below this threshold will not generate a notification, prev
 **Rate limiting**: at most one Discord alert is sent per 60-second window, regardless of how frequently mitigation fires during an attack.
 
 **How to get a webhook URL**: in your Discord server go to *Channel Settings → Integrations → Webhooks → New Webhook*, copy the URL, and set it as `PROXY_DISCORD_WEBHOOK_URL`.
+
+### L4 / XDP Flood Alerts
+
+The alerts above are driven by the **L7** layer (HTTP request rate). A purely **volumetric L4 flood** — UDP floods, malformed-TCP storms, or raw junk hammering ports 80/443 — is absorbed by the XDP program and never reaches the request counter, so it would otherwise be invisible. When the `xdp` feature is built **and** an interface is attached (`PROXY_XDP_INTERFACE`), the per-second XDP stats loop additionally watches the **dropped-packets-per-second** rate and fires a separate set of alerts.
+
+**What triggers an L4 alert**
+
+- XDP-dropped packets/sec rises above `PROXY_XDP_ALERT_PPS` (default `1000`). A flood-start embed fires (with a 60 s cooldown between successive starts), progress updates every 3 minutes, and an all-clear once the rate stays below threshold for 5 s.
+
+**Attack classification** — the eBPF program counts *why* each packet was dropped, and the alert names the dominant category:
+
+| Type | Meaning |
+| :--- | :--- |
+| UDP flood | High volume of UDP packets to 80/443 (the proxy serves no UDP) |
+| Non-HTTP junk flood (:80) | TCP payloads to :80 that aren't a valid HTTP request line |
+| Non-TLS junk flood (:443) | TCP payloads to :443 that aren't a TLS ClientHello |
+| Malformed-TCP flood | Truncated / crafted TCP segments |
+| Blocklisted-IP flood | Packets from IPs already on the XDP blocklist |
+
+**Payload fingerprint** — for payload-bearing drops the eBPF program samples the first 16 bytes of each dropped packet, FNV-1a–hashes them into an LRU map, and counts occurrences. Floods almost always replay an identical payload, so the highest-count fingerprint *is* the attack signature. The alert renders the top three as hex + printable-ASCII with their hit counts, e.g.:
+
+```
+#1 ×84213
+hex 5c 78 39 30 5c 78 30 30 5c 78 39 30 5c 78 30 30
+txt \x90\x00\x90\x00
+```
+
+The fingerprint set is cleared at each all-clear so every attack window starts fresh. A header-only/volumetric flood (e.g. spoofed SYNs with no payload) records no fingerprint, which the alert states explicitly.
+
+**Prometheus** — the per-reason drop breakdown is also exported as `ddos_proxy_xdp_drops_total{reason="…"}` alongside the existing `ddos_proxy_xdp_packets_total`.
 
 ## Security Notes
 

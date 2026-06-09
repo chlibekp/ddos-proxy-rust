@@ -53,6 +53,22 @@ pub static XDP_PACKETS: Lazy<IntCounterVec> = Lazy::new(|| {
     c
 });
 
+/// XDP-dropped packets broken down by drop reason (blocklist, udp, tcp_malformed,
+/// http_invalid, tls_invalid). Complements `XDP_PACKETS{action="blocked"}` with
+/// the *why*, so the dominant attack vector is visible in Prometheus/Grafana.
+pub static XDP_DROPS: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "ddos_proxy_xdp_drops_total",
+            "Total packets dropped by XDP, broken down by drop reason",
+        ),
+        &["reason"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).unwrap();
+    c
+});
+
 /// Backend HTTP response counter, labelled by status class: 2xx, 3xx, 4xx, 5xx, or error.
 pub static BACKEND_RESPONSES: Lazy<IntCounterVec> = Lazy::new(|| {
     let c = IntCounterVec::new(
@@ -175,6 +191,9 @@ pub fn init() {
         .inc_by(0);
     XDP_PACKETS.with_label_values(&["allowed"]).inc_by(0);
     XDP_PACKETS.with_label_values(&["blocked"]).inc_by(0);
+    for reason in ["blocklist", "udp", "tcp_malformed", "http_invalid", "tls_invalid"] {
+        XDP_DROPS.with_label_values(&[reason]).inc_by(0);
+    }
     BACKEND_RESPONSES.with_label_values(&["2xx"]).inc_by(0);
     BACKEND_RESPONSES.with_label_values(&["3xx"]).inc_by(0);
     BACKEND_RESPONSES.with_label_values(&["4xx"]).inc_by(0);
