@@ -657,6 +657,31 @@ impl Manager {
             .map(|s| s.to_string())
             .unwrap_or_default();
 
+        // Rate-limit /challenge/verify to at most PROXY_MAX_VERIFY_ATTEMPTS failed
+        // submissions per IP per 60-second window. This prevents brute-forcing the PoW
+        // nonce: without this guard an attacker can POST garbage indefinitely because
+        // failed verifications don't increment the violation counter.
+        if let Some(state) = self.get_client_state(&ip, &host) {
+            let now_s = now_unix();
+            let over_limit = {
+                let mut inner = state.inner.lock().unwrap();
+                // Reset the window if it started more than 60 seconds ago.
+                if now_s - inner.verify_fail_window_s >= 60 {
+                    inner.verify_fail_window_s = now_s;
+                    inner.verify_fail_count = 0;
+                }
+                inner.verify_fail_count += 1;
+                inner.verify_fail_count > self.cfg.max_verify_attempts
+            };
+            if over_limit {
+                tracing::debug!(ip = %ip, "verify rate limit exceeded");
+                if self.prom() {
+                    metrics::verify_rate_limited();
+                }
+                return text_response(StatusCode::TOO_MANY_REQUESTS, "Too many verification attempts, please wait");
+            }
+        }
+
         // Read and parse form body.
         let body_bytes = match req.into_body().collect().await {
             Ok(c) => c.to_bytes(),
@@ -739,6 +764,7 @@ impl Manager {
                 inner.verified = true;
                 inner.verified_at_ms = now_ms;
                 inner.pow_salt = String::new();
+                inner.verify_fail_count = 0;
                 issued
             };
             state.blocked_flag.store(false, Ordering::SeqCst);

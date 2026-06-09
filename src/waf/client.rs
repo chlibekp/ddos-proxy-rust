@@ -31,6 +31,10 @@ pub struct Inner {
     pub l4_blocked: bool,
     /// Token expected back in the cookie-challenge cookie for this client.
     pub cookie_token: String,
+    /// Unix second at which the current verify-attempt window started.
+    pub verify_fail_window_s: i64,
+    /// Number of failed /challenge/verify submissions in the current window.
+    pub verify_fail_count: i64,
 }
 
 impl Default for ClientState {
