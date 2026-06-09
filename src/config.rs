@@ -54,6 +54,11 @@ pub struct Config {
     /// Alerts are suppressed for bursts ≤ 500 req/min and rate-limited to one per minute.
     /// `None` disables alerting.
     pub discord_webhook_url: Option<String>,
+
+    /// Maximum number of failed `/challenge/verify` submissions an IP may make in a
+    /// 60-second window before the endpoint returns 429.  Default: 5.
+    /// Set via `PROXY_MAX_VERIFY_ATTEMPTS`.
+    pub max_verify_attempts: i64,
 }
 
 /// Error returned when required configuration is missing.
@@ -194,6 +199,11 @@ impl Config {
 
         let discord_webhook_url = env_nonempty("PROXY_DISCORD_WEBHOOK_URL");
 
+        let max_verify_attempts = env_nonempty("PROXY_MAX_VERIFY_ATTEMPTS")
+            .and_then(|s| s.parse::<i64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(5);
+
         Ok(Config {
             backend_url,
             port,
@@ -232,6 +242,7 @@ impl Config {
             healthz_path,
             healthz_backend_path,
             discord_webhook_url,
+            max_verify_attempts,
         })
     }
 }

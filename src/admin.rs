@@ -465,11 +465,13 @@ mod tests {
             healthz_enabled: true,
             healthz_path: "/healthz".to_string(),
             healthz_backend_path: "/".to_string(),
+            discord_webhook_url: None,
+            max_verify_attempts: 5,
         });
         let rl = Arc::new(RateLimiter::new());
         let target: http::Uri = "http://127.0.0.1:8081".parse().unwrap();
         let proxy = Arc::new(Proxy::new(target, cfg.clone()));
-        Manager::new(cfg, rl, "<html></html>".to_string(), None, proxy)
+        Manager::new(cfg, rl, "<html></html>".to_string(), None, proxy, None)
     }
 
     #[tokio::test]

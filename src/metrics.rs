@@ -138,6 +138,17 @@ pub static HEALTHZ_CHECKS: Lazy<IntCounterVec> = Lazy::new(|| {
     c
 });
 
+/// IPs that exceeded the per-IP /challenge/verify rate limit (PROXY_MAX_VERIFY_ATTEMPTS).
+pub static VERIFY_RATE_LIMITED: Lazy<IntCounter> = Lazy::new(|| {
+    let c = IntCounter::new(
+        "ddos_proxy_verify_rate_limited_total",
+        "Requests to /challenge/verify rejected because the IP exceeded PROXY_MAX_VERIFY_ATTEMPTS",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).unwrap();
+    c
+});
+
 /// Current number of tracked per-IP client states. Updated every 10 s by the cleanup ticker.
 pub static IP_STATES: Lazy<IntGauge> = Lazy::new(|| {
     let g = IntGauge::new(
@@ -173,6 +184,7 @@ pub fn init() {
     let _ = &*BACKEND_REQUEST_DURATION;
     let _ = &*IP_STATES;
     let _ = &*PER_IP_RATE_LIMITED;
+    let _ = &*VERIFY_RATE_LIMITED;
     let _ = &*CHALLENGE_ABANDONED;
     HEALTHZ_CHECKS.with_label_values(&["ok"]).inc_by(0);
     HEALTHZ_CHECKS.with_label_values(&["error"]).inc_by(0);
@@ -219,6 +231,11 @@ pub fn challenge_solved(challenge_type: &str, elapsed_secs: f64) {
 /// Increment the per-IP rate limit counter.
 pub fn per_ip_rate_limited() {
     PER_IP_RATE_LIMITED.inc();
+}
+
+/// Increment the verify-endpoint rate limit counter.
+pub fn verify_rate_limited() {
+    VERIFY_RATE_LIMITED.inc();
 }
 
 /// Record `count` challenges that were abandoned (client state evicted before solve).
@@ -298,6 +315,14 @@ mod tests {
         per_ip_rate_limited();
         per_ip_rate_limited();
         assert_eq!(PER_IP_RATE_LIMITED.get(), before + 2);
+    }
+
+    #[test]
+    fn verify_rate_limited_increments_counter() {
+        let before = VERIFY_RATE_LIMITED.get();
+        verify_rate_limited();
+        verify_rate_limited();
+        assert_eq!(VERIFY_RATE_LIMITED.get(), before + 2);
     }
 
     #[test]
