@@ -15,6 +15,9 @@ pub struct ClientState {
     pub ip_req_window: AtomicI64,
     /// Requests counted in the current ip_req_window second.
     pub ip_req_count: AtomicI64,
+    /// Requests from this client currently being proxied (in flight). Used by
+    /// the PROXY_MAX_CONCURRENT_PER_IP cap.
+    pub inflight: AtomicI64,
 }
 
 #[derive(Default)]
@@ -35,6 +38,14 @@ pub struct Inner {
     pub verify_fail_window_s: i64,
     /// Number of failed /challenge/verify submissions in the current window.
     pub verify_fail_count: i64,
+    /// PoW difficulty the last served challenge was rendered with (0 = use the
+    /// configured base difficulty). Lets verification accept the difficulty the
+    /// client was actually given when adaptive difficulty changes mid-flight.
+    pub pow_difficulty_issued: usize,
+    /// Unix second at which the current 404-counting window started.
+    pub not_found_window_s: i64,
+    /// Backend 404 responses served to this client in the current window.
+    pub not_found_count: i64,
 }
 
 impl Default for ClientState {
@@ -47,6 +58,7 @@ impl Default for ClientState {
             inner: Mutex::new(Inner::default()),
             ip_req_window: AtomicI64::new(0),
             ip_req_count: AtomicI64::new(0),
+            inflight: AtomicI64::new(0),
         }
     }
 }
