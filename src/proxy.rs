@@ -604,7 +604,14 @@ impl Proxy {
             }
 
             let decoded: Vec<u8> = if ce == "gzip" {
-                decode_gzip(&bytes).unwrap_or_else(|| bytes.to_vec())
+                match decode_gzip(&bytes) {
+                    Some(d) => d,
+                    None => {
+                        // Decode failed — leave the compressed body untouched.
+                        strip_hop_by_hop(&mut parts.headers);
+                        return Response::from_parts(parts, full(bytes));
+                    }
+                }
             } else {
                 bytes.to_vec()
             };
@@ -853,13 +860,14 @@ impl Proxy {
         if let Ok(hv) = HeaderValue::from_str(&original_host) {
             parts.headers.insert(http::header::HOST, hv);
         }
-        let client_ip = ctx
+        let client_ip_raw = ctx
             .remote_addr
             .rsplit_once(':')
             .map(|(h, _)| h)
             .unwrap_or(&ctx.remote_addr);
+        let client_ip = client_ip_raw.trim_matches(|c| c == '[' || c == ']');
         append_xff(&mut parts.headers, client_ip);
-        if let Ok(hv) = HeaderValue::from_str(client_ip.trim_matches(|c| c == '[' || c == ']')) {
+        if let Ok(hv) = HeaderValue::from_str(client_ip) {
             parts.headers.insert(HeaderName::from_static("x-real-ip"), hv);
         }
 

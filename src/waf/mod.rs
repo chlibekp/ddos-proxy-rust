@@ -286,6 +286,11 @@ impl Manager {
                     abandoned += 1;
                 }
                 evicted_mitigation_ended += 1;
+                if inner.l4_blocked {
+                    if let Some(ip) = key.split('|').next() {
+                        to_unblock.push(ip.to_string());
+                    }
+                }
                 to_delete.push(key);
                 continue;
             }
@@ -311,6 +316,11 @@ impl Manager {
                     abandoned += 1;
                 }
                 evicted_idle += 1;
+                if inner.l4_blocked {
+                    if let Some(ip) = key.split('|').next() {
+                        to_unblock.push(ip.to_string());
+                    }
+                }
                 to_delete.push(key.clone());
             }
         }
