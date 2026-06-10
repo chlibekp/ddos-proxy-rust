@@ -264,6 +264,18 @@ pub fn init() {
     DROPPED_REQUESTS
         .with_label_values(&["metrics_rate_limit"])
         .inc_by(0);
+    for reason in [
+        "ip_denylist",
+        "ua_denylist",
+        "method_not_allowed",
+        "body_too_large",
+        "maintenance",
+    ] {
+        DROPPED_REQUESTS.with_label_values(&[reason]).inc_by(0);
+    }
+    for reason in ["trusted_ip", "exempt_path"] {
+        ALLOWED_REQUESTS.with_label_values(&[reason]).inc_by(0);
+    }
     XDP_PACKETS.with_label_values(&["allowed"]).inc_by(0);
     XDP_PACKETS.with_label_values(&["blocked"]).inc_by(0);
     for reason in [
@@ -287,6 +299,7 @@ pub fn init() {
     BACKEND_RESPONSES.with_label_values(&["4xx"]).inc_by(0);
     BACKEND_RESPONSES.with_label_values(&["5xx"]).inc_by(0);
     BACKEND_RESPONSES.with_label_values(&["error"]).inc_by(0);
+    BACKEND_RESPONSES.with_label_values(&["timeout"]).inc_by(0);
     // Force Lazy initialisation so histograms, vecs, and gauge appear on the first scrape.
     let _ = &*BACKEND_REQUEST_DURATION;
     let _ = &*IP_STATES;

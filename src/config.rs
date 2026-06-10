@@ -1,6 +1,8 @@
 use std::env;
 use std::time::Duration;
 
+use crate::netmatch::IpCidr;
+
 /// Application configuration loaded from environment variables.
 /// Field defaults and parsing semantics mirror the Go implementation exactly.
 #[derive(Clone, Debug)]
@@ -65,6 +67,41 @@ pub struct Config {
     /// Default: 1000. Set via `PROXY_XDP_ALERT_PPS`. Only meaningful when both
     /// `PROXY_XDP_INTERFACE` and `PROXY_DISCORD_WEBHOOK_URL` are configured.
     pub xdp_alert_pps: i64,
+
+    /// IPs/CIDRs that bypass the WAF entirely (monitoring probes, internal
+    /// infrastructure, office ranges). Set via `PROXY_TRUSTED_IPS`
+    /// (comma-separated, e.g. `10.0.0.0/8,192.168.1.5,2001:db8::/32`).
+    pub trusted_ips: Vec<IpCidr>,
+    /// IPs/CIDRs that are always blocked (served the configured block action)
+    /// before any other processing. Set via `PROXY_DENY_IPS`.
+    pub deny_ips: Vec<IpCidr>,
+    /// User-Agent substrings that are blocked outright with 403.
+    /// Set via `PROXY_BLOCKED_UA` (comma-separated, case-insensitive match).
+    pub blocked_ua: Vec<String>,
+    /// Path prefixes that are never served a challenge (webhooks, payment
+    /// callbacks, machine-to-machine APIs that can't run JS or keep cookies).
+    /// Blocked IPs are still blocked on these paths. Set via
+    /// `PROXY_EXEMPT_PATHS` (comma-separated, each must start with `/`).
+    pub exempt_paths: Vec<String>,
+    /// Maximum time to wait for the backend to start responding before
+    /// returning 504. Set via `PROXY_BACKEND_TIMEOUT` (default `30s`,
+    /// `0` disables the timeout).
+    pub backend_timeout: Duration,
+    /// Maximum declared request body size in bytes (checked against
+    /// `Content-Length`). Oversized requests get 413. Set via
+    /// `PROXY_MAX_BODY_SIZE`; `0` or absent disables the check.
+    pub max_body_size: Option<u64>,
+    /// HTTP methods accepted by the proxy (uppercase). Empty means all methods
+    /// are allowed. Set via `PROXY_ALLOWED_METHODS`
+    /// (e.g. `GET,POST,PUT,DELETE,HEAD,OPTIONS,PATCH`).
+    pub allowed_methods: Vec<String>,
+    /// When true, standard security headers (HSTS on TLS, nosniff,
+    /// X-Frame-Options, Referrer-Policy) are added to proxied responses
+    /// unless the backend already set them. Set via `PROXY_SECURITY_HEADERS`.
+    pub security_headers: bool,
+    /// When true, every request is logged as a structured JSON line
+    /// (method, path, status, duration, client IP). Set via `PROXY_ACCESS_LOG`.
+    pub access_log: bool,
 }
 
 /// Error returned when required configuration is missing.
@@ -214,6 +251,50 @@ impl Config {
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(1000);
 
+        let trusted_ips = env_nonempty("PROXY_TRUSTED_IPS")
+            .map(|s| crate::netmatch::parse_cidr_list(&s))
+            .unwrap_or_default();
+        let deny_ips = env_nonempty("PROXY_DENY_IPS")
+            .map(|s| crate::netmatch::parse_cidr_list(&s))
+            .unwrap_or_default();
+
+        let blocked_ua = env_nonempty("PROXY_BLOCKED_UA")
+            .map(|s| {
+                s.split(',')
+                    .map(|p| p.trim().to_lowercase())
+                    .filter(|p| !p.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        // Only rooted prefixes make sense; anything else is silently dropped.
+        let exempt_paths = env_nonempty("PROXY_EXEMPT_PATHS")
+            .map(|s| {
+                s.split(',')
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| p.starts_with('/'))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let backend_timeout = parse_duration_env("PROXY_BACKEND_TIMEOUT", Duration::from_secs(30));
+
+        let max_body_size = env_nonempty("PROXY_MAX_BODY_SIZE")
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&v| v > 0);
+
+        let allowed_methods = env_nonempty("PROXY_ALLOWED_METHODS")
+            .map(|s| {
+                s.split(',')
+                    .map(|p| p.trim().to_uppercase())
+                    .filter(|p| !p.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let security_headers = parse_bool("PROXY_SECURITY_HEADERS");
+        let access_log = parse_bool("PROXY_ACCESS_LOG");
+
         Ok(Config {
             backend_url,
             port,
@@ -254,6 +335,15 @@ impl Config {
             discord_webhook_url,
             max_verify_attempts,
             xdp_alert_pps,
+            trusted_ips,
+            deny_ips,
+            blocked_ua,
+            exempt_paths,
+            backend_timeout,
+            max_body_size,
+            allowed_methods,
+            security_headers,
+            access_log,
         })
     }
 }

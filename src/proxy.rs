@@ -194,11 +194,28 @@ impl Proxy {
             host: original_host,
         };
 
-        // Send to backend.
+        // Send to backend, bounded by PROXY_BACKEND_TIMEOUT (time to first
+        // response headers). A hung backend otherwise pins request tasks open
+        // indefinitely, which is itself a DoS amplifier.
         let req_start = std::time::Instant::now();
-        let upstream = match self.client.request(outbound).await {
-            Ok(r) => r,
-            Err(e) => {
+        let upstream_result = if self.cfg.backend_timeout.is_zero() {
+            Ok(self.client.request(outbound).await)
+        } else {
+            tokio::time::timeout(self.cfg.backend_timeout, self.client.request(outbound)).await
+        };
+        let upstream = match upstream_result {
+            Err(_) => {
+                tracing::error!(
+                    timeout_secs = self.cfg.backend_timeout.as_secs(),
+                    "Backend request timed out"
+                );
+                if self.cfg.prometheus_enabled {
+                    crate::metrics::backend_response("timeout");
+                    crate::metrics::backend_duration(req_start.elapsed().as_secs_f64());
+                }
+                return error_response(StatusCode::GATEWAY_TIMEOUT, "Gateway Timeout");
+            }
+            Ok(Err(e)) => {
                 tracing::error!(error = %e, "Proxy error");
                 if self.cfg.prometheus_enabled {
                     crate::metrics::backend_response("error");
@@ -206,6 +223,7 @@ impl Proxy {
                 }
                 return error_response(StatusCode::BAD_GATEWAY, "Bad Gateway");
             }
+            Ok(Ok(r)) => r,
         };
 
         // Convert to buffered form when we may store or inject; otherwise stream.
@@ -379,7 +397,7 @@ impl Proxy {
             return Response::from_parts(parts, body);
         }
 
-        self.apply_common_headers(&mut parts.headers, cache_status);
+        self.apply_common_headers(&mut parts.headers, cache_status, ctx.is_tls);
         self.rewrite_location(&mut parts.headers, meta, ctx);
 
         // Collect the buffered body.
@@ -443,16 +461,38 @@ impl Proxy {
         if parts.status == StatusCode::SWITCHING_PROTOCOLS {
             return Response::from_parts(parts, body);
         }
-        self.apply_common_headers(&mut parts.headers, cache_status);
+        self.apply_common_headers(&mut parts.headers, cache_status, ctx.is_tls);
         self.rewrite_location(&mut parts.headers, meta, ctx);
         strip_hop_by_hop(&mut parts.headers);
         Response::from_parts(parts, body)
     }
 
-    fn apply_common_headers(&self, headers: &mut HeaderMap, cache_status: CacheStatus) {
+    fn apply_common_headers(&self, headers: &mut HeaderMap, cache_status: CacheStatus, is_tls: bool) {
         headers.insert(HeaderName::from_static("via"), HeaderValue::from_static(VIA_BANNER));
         headers.remove(http::header::SERVER);
         headers.insert(http::header::SERVER, HeaderValue::from_static(SERVER_BANNER));
+
+        // Optional security headers; backend-set values always win.
+        if self.cfg.security_headers {
+            for (name, value) in [
+                ("x-content-type-options", "nosniff"),
+                ("x-frame-options", "SAMEORIGIN"),
+                ("referrer-policy", "strict-origin-when-cross-origin"),
+            ] {
+                let name = HeaderName::from_static(name);
+                if !headers.contains_key(&name) {
+                    headers.insert(name, HeaderValue::from_static(value));
+                }
+            }
+            // HSTS only makes sense on TLS responses (browsers ignore it on
+            // plain HTTP, and setting it there can mask misconfiguration).
+            if is_tls && !headers.contains_key(http::header::STRICT_TRANSPORT_SECURITY) {
+                headers.insert(
+                    http::header::STRICT_TRANSPORT_SECURITY,
+                    HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+                );
+            }
+        }
 
         let value = match cache_status {
             CacheStatus::Hit => {

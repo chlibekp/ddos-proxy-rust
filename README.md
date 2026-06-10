@@ -18,6 +18,14 @@ This is a Rust implementation of a DDoS protection proxy.
 - **User-Agent Whitelisting**: Allows trusted bots (e.g. Googlebot) to bypass challenges, subject to a separate global rate limit.
 - **Disk Caching**: Built-in HTTP caching layer that respects standard `Cache-Control` headers.
 - **Prometheus Metrics**: Exposes a `/metrics` endpoint, secured with a rate limit of 1 req/s per IP.
+- **IP Allow/Deny Lists**: CIDR-based trusted ranges that bypass the WAF (`PROXY_TRUSTED_IPS`) and ranges that are always blocked (`PROXY_DENY_IPS`).
+- **User-Agent Denylist**: Block known-bad scanners and scrapers by UA substring (`PROXY_BLOCKED_UA`).
+- **Challenge-Exempt Paths**: Path prefixes (webhooks, payment callbacks) that are proxied without ever being challenged (`PROXY_EXEMPT_PATHS`).
+- **Request Hygiene Filters**: HTTP method allowlist (`PROXY_ALLOWED_METHODS`) and a declared body-size cap (`PROXY_MAX_BODY_SIZE`).
+- **Backend Timeout**: Bounded time-to-first-byte for the backend hop (`PROXY_BACKEND_TIMEOUT`) so a hung origin returns `504` instead of pinning connections open.
+- **Security Headers**: Optional injection of standard security headers, including HSTS on TLS (`PROXY_SECURITY_HEADERS`).
+- **Access Logging**: Optional structured JSON access log for every request (`PROXY_ACCESS_LOG`).
+- **Maintenance Mode**: Toggle a `503` maintenance page for all traffic from the admin dashboard or via `POST`/`DELETE /ddos-proxy/admin/maintenance`; `/metrics`, `/healthz` and the admin API stay reachable.
 
 ## Configuration
 
@@ -59,6 +67,15 @@ The proxy is configured via environment variables.
 | `PROXY_XDP_ALERT_PPS` | `1000` | Dropped-packets-per-second threshold (measured at the XDP/L4 layer) above which a Discord **L4-flood** alert fires. `0` or less disables L4 alerting. Only active when both `PROXY_XDP_INTERFACE` and `PROXY_DISCORD_WEBHOOK_URL` are set. |
 | `PROXY_MAX_IP_STATES` | `500000` | Cap on tracked client IP states (0 = unlimited) to bound memory under spoofed floods. |
 | `PROXY_DISCORD_WEBHOOK_URL` | `""` | Discord incoming-webhook URL. When set, a rich embed is posted to this channel whenever mitigation mode is triggered by sustained traffic exceeding **500 req/min** (~8.3 req/s). Alerts are rate-limited to at most **one per minute** to prevent webhook spam. Leave empty to disable. |
+| `PROXY_TRUSTED_IPS` | `""` | Comma-separated IPs/CIDRs (IPv4 + IPv6) that bypass the WAF entirely (e.g. `10.0.0.0/8,192.168.1.5,2001:db8::/32`). Use for monitoring probes and internal infrastructure. |
+| `PROXY_DENY_IPS` | `""` | Comma-separated IPs/CIDRs that are always blocked (served `PROXY_BLOCK_ACTION`) before any other processing. |
+| `PROXY_BLOCKED_UA` | `""` | Comma-separated User-Agent substrings to block outright with `403` (case-insensitive, e.g. `sqlmap,nikto,masscan`). Checked before the UA whitelist. |
+| `PROXY_EXEMPT_PATHS` | `""` | Comma-separated path prefixes that are never served a challenge (e.g. `/api/webhooks,/.well-known/`). For machine-to-machine endpoints that can't run JS or keep cookies. Blocked/denied IPs are still blocked on these paths. |
+| `PROXY_BACKEND_TIMEOUT` | `30s` | Max time to wait for the backend to start responding before returning `504 Gateway Timeout`. `0` disables the timeout. |
+| `PROXY_MAX_BODY_SIZE` | `0` (off) | Maximum request body size in bytes, checked against the declared `Content-Length`. Oversized requests get `413 Payload Too Large`. |
+| `PROXY_ALLOWED_METHODS` | `""` (all) | Comma-separated HTTP methods to accept (e.g. `GET,POST,PUT,DELETE,HEAD,OPTIONS`). Other methods get `405 Method Not Allowed`. |
+| `PROXY_SECURITY_HEADERS` | `false` | If `true`, adds `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy` (and `Strict-Transport-Security` on TLS) to proxied responses unless the backend already set them. |
+| `PROXY_ACCESS_LOG` | `false` | If `true`, logs every request as a structured JSON line (`method`, `path`, `status`, `duration_ms`, `ip`). |
 
 ## Usage
 

@@ -6,6 +6,7 @@ mod discord;
 mod health;
 mod limiter;
 mod metrics;
+mod netmatch;
 mod proxy;
 mod tls;
 mod util;
@@ -211,25 +212,64 @@ async fn serve_plain(
 }
 
 /// Route a request: `/metrics`, `/healthz`, and `/admin/` bypass the WAF;
-/// everything else goes through the WAF middleware.
+/// everything else goes through the WAF middleware. When `PROXY_ACCESS_LOG`
+/// is enabled, every request (including bypass routes) is logged with its
+/// outcome and duration.
 pub async fn route(
     req: Request<Incoming>,
     ctx: ReqCtx,
     manager: Arc<Manager>,
     ip_limiter: Option<Arc<IPLimiter>>,
 ) -> Result<Response<BoxedBody>, Infallible> {
+    if !manager.config().access_log {
+        return Ok(dispatch(req, ctx, manager, ip_limiter).await);
+    }
+
+    let start = std::time::Instant::now();
+    let method = req.method().to_string();
+    let path = req
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
+    let ip = ctx
+        .remote_addr
+        .rsplit_once(':')
+        .map(|(h, _)| h.trim_matches(|c| c == '[' || c == ']').to_string())
+        .unwrap_or_else(|| ctx.remote_addr.clone());
+
+    let resp = dispatch(req, ctx, manager, ip_limiter).await;
+
+    tracing::info!(
+        target: "access",
+        method = %method,
+        path = %path,
+        status = resp.status().as_u16(),
+        duration_ms = start.elapsed().as_millis() as u64,
+        ip = %ip,
+        "request",
+    );
+    Ok(resp)
+}
+
+async fn dispatch(
+    req: Request<Incoming>,
+    ctx: ReqCtx,
+    manager: Arc<Manager>,
+    ip_limiter: Option<Arc<IPLimiter>>,
+) -> Response<BoxedBody> {
     if manager.config().prometheus_enabled && req.uri().path() == "/metrics" {
-        return Ok(metrics_endpoint(&ctx, ip_limiter.as_deref()));
+        return metrics_endpoint(&ctx, ip_limiter.as_deref());
     }
     let path = req.uri().path();
     if path.starts_with("/ddos-proxy/admin") {
-        return Ok(admin::handle(req, ctx, manager).await);
+        return admin::handle(req, ctx, manager).await;
     }
     let cfg = manager.config();
     if cfg.healthz_enabled && path == cfg.healthz_path {
-        return Ok(health::handle(manager.proxy(), &cfg.healthz_backend_path.clone()).await);
+        return health::handle(manager.proxy(), &cfg.healthz_backend_path.clone()).await;
     }
-    Ok(manager.handle(req, ctx).await)
+    manager.handle(req, ctx).await
 }
 
 fn metrics_endpoint(ctx: &ReqCtx, ip_limiter: Option<&IPLimiter>) -> Response<BoxedBody> {
