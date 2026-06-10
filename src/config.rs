@@ -102,6 +102,79 @@ pub struct Config {
     /// When true, every request is logged as a structured JSON line
     /// (method, path, status, duration, client IP). Set via `PROXY_ACCESS_LOG`.
     pub access_log: bool,
+
+    /// Path prefixes that are blocked outright with 403 (matched against the
+    /// normalized path). Set via `PROXY_BLOCKED_PATHS` (e.g. `/.env,/.git,/wp-admin`).
+    pub blocked_paths: Vec<String>,
+    /// Regex matched against the raw path+query; matching requests get 403.
+    /// Set via `PROXY_BLOCK_REGEX` (e.g. `(?i)(union\s+select|\.\./\.\./)`).
+    pub block_regex: Option<regex::Regex>,
+    /// Hostnames the proxy will serve (lowercase, port stripped). Entries may be
+    /// exact (`example.com`) or wildcard (`*.example.com`). Empty = all hosts.
+    /// Set via `PROXY_ALLOWED_HOSTS`.
+    pub allowed_hosts: Vec<String>,
+    /// When true, requests without a User-Agent header are rejected with 403.
+    /// Set via `PROXY_REQUIRE_UA`.
+    pub require_ua: bool,
+    /// Maximum length of the request path+query in bytes; longer requests get
+    /// 414. Set via `PROXY_MAX_URI_LEN`; `0` or absent disables.
+    pub max_uri_len: Option<usize>,
+    /// Honeypot path prefixes: any client touching one is immediately blocked
+    /// (real users have no reason to request them). Set via `PROXY_HONEYPOT_PATHS`.
+    pub honeypot_paths: Vec<String>,
+    /// Backend 404 responses a single IP may receive in a 60-second window
+    /// before being blocked as a scanner. Set via `PROXY_MAX_404_PER_IP`;
+    /// `0` or absent disables.
+    pub max_404_per_ip: Option<i64>,
+    /// Site-wide HTTP Basic auth gate (e.g. for staging environments). Stores
+    /// the full expected `Authorization` header value. Set via
+    /// `PROXY_BASIC_AUTH=user:password`; absent disables.
+    pub basic_auth: Option<String>,
+    /// Maximum concurrent in-flight requests per client IP; excess gets 429.
+    /// Set via `PROXY_MAX_CONCURRENT_PER_IP`; `0` or absent disables.
+    pub max_concurrent_per_ip: Option<i64>,
+    /// Global cap on concurrent in-flight requests; excess gets 503. Bounds
+    /// memory/FDs under extreme load. Set via `PROXY_MAX_INFLIGHT`.
+    pub max_inflight: Option<i64>,
+    /// Number of times an idempotent (GET/HEAD) request is retried against the
+    /// backend after a transport error. Set via `PROXY_BACKEND_RETRIES` (default 0).
+    pub backend_retries: u32,
+    /// Consecutive backend transport failures that trip the circuit breaker
+    /// (fail-fast 503 for `cb_cooldown`). Set via `PROXY_CB_THRESHOLD`; `0` disables.
+    pub cb_threshold: i64,
+    /// How long the circuit stays open after tripping. Set via
+    /// `PROXY_CB_COOLDOWN` (default `30s`).
+    pub cb_cooldown: Duration,
+    /// When true and the backend errors/times out (or returns 5xx) on a GET,
+    /// a stale cached copy is served instead if one exists (requires
+    /// `PROXY_CACHE_ENABLED`). Set via `PROXY_SERVE_STALE`.
+    pub serve_stale: bool,
+    /// When true, an `X-Request-Id` is generated (or a valid inbound one kept),
+    /// forwarded to the backend and returned on the response. Set via
+    /// `PROXY_REQUEST_ID`.
+    pub request_id: bool,
+    /// Extra response headers, applied after the backend response (overwrite).
+    /// Set via `PROXY_ADD_HEADERS` (`Name=Value;Name2=Value2`).
+    pub add_headers: Vec<(String, String)>,
+    /// Response headers stripped before returning to the client (e.g. hide
+    /// `X-Powered-By`). Set via `PROXY_REMOVE_HEADERS` (comma-separated).
+    pub remove_headers: Vec<String>,
+    /// When set, CORS headers are added to responses unless the backend set
+    /// them. Set via `PROXY_CORS_ORIGIN` (e.g. `*` or `https://app.example.com`).
+    pub cors_origin: Option<String>,
+    /// When true, compressible (text/JSON/JS/SVG) buffered responses ≥ 1 KiB are
+    /// gzip-compressed if the client accepts gzip and the backend didn't already
+    /// encode. Set via `PROXY_COMPRESSION`.
+    pub compression: bool,
+    /// PoW difficulty used while a mitigation window is active (adaptive
+    /// hardening under attack). Set via `PROXY_POW_DIFFICULTY_ATTACK`;
+    /// absent keeps the base difficulty always.
+    pub pow_difficulty_attack: Option<usize>,
+    /// Per-path-prefix global rate limits: requests/second to a prefix above
+    /// which that path is served the challenge (protects expensive endpoints
+    /// like `/login` without global mitigation). Set via
+    /// `PROXY_PATH_RATE_LIMITS` (e.g. `/login=5,/api=100`).
+    pub path_rate_limits: Vec<(String, i64)>,
 }
 
 /// Error returned when required configuration is missing.
@@ -295,6 +368,116 @@ impl Config {
         let security_headers = parse_bool("PROXY_SECURITY_HEADERS");
         let access_log = parse_bool("PROXY_ACCESS_LOG");
 
+        let blocked_paths = parse_path_list("PROXY_BLOCKED_PATHS");
+        let honeypot_paths = parse_path_list("PROXY_HONEYPOT_PATHS");
+
+        let block_regex = env_nonempty("PROXY_BLOCK_REGEX").and_then(|s| {
+            match regex::Regex::new(&s) {
+                Ok(re) => Some(re),
+                Err(e) => {
+                    tracing::warn!(error = %e, "Ignoring invalid PROXY_BLOCK_REGEX");
+                    None
+                }
+            }
+        });
+
+        let allowed_hosts = env_nonempty("PROXY_ALLOWED_HOSTS")
+            .map(|s| {
+                s.split(',')
+                    .map(|p| p.trim().to_lowercase())
+                    .filter(|p| !p.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let require_ua = parse_bool("PROXY_REQUIRE_UA");
+
+        let max_uri_len = env_nonempty("PROXY_MAX_URI_LEN")
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&v| v > 0);
+
+        let max_404_per_ip = env_nonempty("PROXY_MAX_404_PER_IP")
+            .and_then(|s| s.parse::<i64>().ok())
+            .filter(|&v| v > 0);
+
+        // Stored as the full expected Authorization header value so the hot
+        // path is a single constant-time compare.
+        let basic_auth = env_nonempty("PROXY_BASIC_AUTH").map(|creds| {
+            use base64::Engine as _;
+            format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(creds.as_bytes())
+            )
+        });
+
+        let max_concurrent_per_ip = env_nonempty("PROXY_MAX_CONCURRENT_PER_IP")
+            .and_then(|s| s.parse::<i64>().ok())
+            .filter(|&v| v > 0);
+        let max_inflight = env_nonempty("PROXY_MAX_INFLIGHT")
+            .and_then(|s| s.parse::<i64>().ok())
+            .filter(|&v| v > 0);
+
+        let backend_retries = env_nonempty("PROXY_BACKEND_RETRIES")
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0)
+            .min(5);
+
+        let cb_threshold = env_nonempty("PROXY_CB_THRESHOLD")
+            .and_then(|s| s.parse::<i64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(0);
+        let cb_cooldown = parse_duration_env("PROXY_CB_COOLDOWN", Duration::from_secs(30));
+
+        let serve_stale = parse_bool("PROXY_SERVE_STALE");
+        let request_id = parse_bool("PROXY_REQUEST_ID");
+
+        let add_headers = env_nonempty("PROXY_ADD_HEADERS")
+            .map(|s| {
+                s.split(';')
+                    .filter_map(|pair| {
+                        let (name, value) = pair.split_once('=')?;
+                        let (name, value) = (name.trim(), value.trim());
+                        if name.is_empty() {
+                            return None;
+                        }
+                        Some((name.to_lowercase(), value.to_string()))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let remove_headers = env_nonempty("PROXY_REMOVE_HEADERS")
+            .map(|s| {
+                s.split(',')
+                    .map(|p| p.trim().to_lowercase())
+                    .filter(|p| !p.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let cors_origin = env_nonempty("PROXY_CORS_ORIGIN");
+        let compression = parse_bool("PROXY_COMPRESSION");
+
+        let pow_difficulty_attack = env_nonempty("PROXY_POW_DIFFICULTY_ATTACK")
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&v| v > 0);
+
+        let path_rate_limits = env_nonempty("PROXY_PATH_RATE_LIMITS")
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|pair| {
+                        let (prefix, limit) = pair.split_once('=')?;
+                        let prefix = prefix.trim();
+                        let limit: i64 = limit.trim().parse().ok()?;
+                        if !prefix.starts_with('/') || limit <= 0 {
+                            return None;
+                        }
+                        Some((prefix.to_string(), limit))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
         Ok(Config {
             backend_url,
             port,
@@ -344,8 +527,42 @@ impl Config {
             allowed_methods,
             security_headers,
             access_log,
+            blocked_paths,
+            block_regex,
+            allowed_hosts,
+            require_ua,
+            max_uri_len,
+            honeypot_paths,
+            max_404_per_ip,
+            basic_auth,
+            max_concurrent_per_ip,
+            max_inflight,
+            backend_retries,
+            cb_threshold,
+            cb_cooldown,
+            serve_stale,
+            request_id,
+            add_headers,
+            remove_headers,
+            cors_origin,
+            compression,
+            pow_difficulty_attack,
+            path_rate_limits,
         })
     }
+}
+
+/// Parse a comma-separated list of rooted path prefixes from `key`,
+/// dropping entries that don't start with `/`.
+fn parse_path_list(key: &str) -> Vec<String> {
+    env_nonempty(key)
+        .map(|s| {
+            s.split(',')
+                .map(|p| p.trim().to_string())
+                .filter(|p| p.starts_with('/'))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
 }
 
 /// Parse a Go `time.ParseDuration`-style string: a possibly-signed sequence of

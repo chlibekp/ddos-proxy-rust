@@ -67,6 +67,40 @@ impl DiskCache {
         })
     }
 
+    /// Like `get_fresh` but ignores the freshness deadline and never deletes the
+    /// entry. Used for serve-stale-on-error: a stale page beats a 502.
+    pub fn get_any(&self, key: &str) -> Option<StoredResponse> {
+        let path = self.path_for(key);
+        let data = std::fs::read(&path).ok()?;
+        if data.len() < 8 {
+            return None;
+        }
+        let meta_len = u64::from_le_bytes(data[..8].try_into().ok()?) as usize;
+        if data.len() < 8 + meta_len {
+            return None;
+        }
+        let meta: Meta = serde_json::from_slice(&data[8..8 + meta_len]).ok()?;
+        let body = Bytes::copy_from_slice(&data[8 + meta_len..]);
+        Some(StoredResponse {
+            status: meta.status,
+            headers: meta.headers,
+            body,
+        })
+    }
+
+    /// Remove every cached entry. Returns the number of files deleted.
+    pub fn purge(&self) -> usize {
+        let mut removed = 0;
+        if let Ok(entries) = std::fs::read_dir(&self.dir) {
+            for entry in entries.flatten() {
+                if entry.path().is_file() && std::fs::remove_file(entry.path()).is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+        removed
+    }
+
     pub fn put(&self, key: &str, status: StatusCode, headers: &HeaderMap, body: &[u8]) {
         // Compute freshness lifetime from Cache-Control.
         let merged: Vec<String> = headers

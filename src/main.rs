@@ -1,3 +1,6 @@
+// Needed by the large serde_json::json! literal in admin::config_json.
+#![recursion_limit = "256"]
+
 mod admin;
 mod body;
 mod cache;

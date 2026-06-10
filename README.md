@@ -25,7 +25,32 @@ This is a Rust implementation of a DDoS protection proxy.
 - **Backend Timeout**: Bounded time-to-first-byte for the backend hop (`PROXY_BACKEND_TIMEOUT`) so a hung origin returns `504` instead of pinning connections open.
 - **Security Headers**: Optional injection of standard security headers, including HSTS on TLS (`PROXY_SECURITY_HEADERS`).
 - **Access Logging**: Optional structured JSON access log for every request (`PROXY_ACCESS_LOG`).
-- **Maintenance Mode**: Toggle a `503` maintenance page for all traffic from the admin dashboard or via `POST`/`DELETE /ddos-proxy/admin/maintenance`; `/metrics`, `/healthz` and the admin API stay reachable.
+- **Maintenance Mode**: Toggle a `503` maintenance page for all traffic from the admin dashboard or via `POST`/`DELETE /ddos-proxy/admin/maintenance`; `/metrics`, `/healthz`, the admin API, and trusted IPs stay reachable.
+- **Request Hygiene & WAF Rules**: blocked path prefixes, a regex rule over path+query, Host allowlist, required User-Agent, URI-length cap — all matched against a normalized path so `..`/`//` tricks don't bypass them.
+- **Honeypot Paths & Scanner Auto-Block**: instantly block clients touching trap paths, and block IPs that rack up backend 404s probing for exploitable files.
+- **Concurrency Caps**: global in-flight request cap (`503`) and per-IP concurrency cap (`429`) against slow-POST/connection-exhaustion attacks.
+- **Backend Resilience**: bounded retries for idempotent requests, a circuit breaker that fails fast while the backend is down, and serve-stale-from-cache on backend errors.
+- **Adaptive PoW Difficulty**: automatically issue a harder proof-of-work challenge while a mitigation window is active.
+- **Per-Path Rate Limits**: protect expensive endpoints (`/login`, search) with their own req/s budgets, challenged independently of global mitigation.
+- **Site-wide Basic Auth**: one env var turns the proxy into an authenticated staging gate.
+- **Response Polish**: optional gzip compression, CORS headers, custom header add/remove, `X-Request-Id` correlation, `X-Real-IP` to the backend.
+- **Runtime Admin API**: manage IP deny/trust lists, force mitigation on/off, clear tracked states, purge the cache, and inspect redacted config — all without a restart.
+
+### Admin API
+
+All endpoints live under `/ddos-proxy/admin` and require `Authorization: Bearer $PROXY_ADMIN_SECRET` (the API is invisible — requests with a wrong/missing token are proxied to the origin). `GET /ddos-proxy/admin/` serves an interactive dashboard.
+
+| Method & path | Action |
+| :--- | :--- |
+| `GET /status` | Mitigation/maintenance state, tracked-IP count, uptime, version |
+| `GET /config` | Redacted view of the running configuration |
+| `GET /states`, `GET /states/{ip\|host}` | List / fetch tracked client states |
+| `DELETE /states` | Clear all tracked states (releases L4 blocks) |
+| `POST /block`, `DELETE /block` | Manually block / unblock `{"ip":"…","host":"…"}` |
+| `GET\|POST\|DELETE /denylist`, `/trustlist` | Runtime IP/CIDR lists, body `{"entry":"10.0.0.0/8"}` |
+| `POST\|DELETE /mitigation` | Force the mitigation window on / off |
+| `POST\|DELETE /maintenance` | Maintenance mode on / off |
+| `DELETE /cache` | Purge the disk cache |
 
 ## Configuration
 
@@ -76,6 +101,27 @@ The proxy is configured via environment variables.
 | `PROXY_ALLOWED_METHODS` | `""` (all) | Comma-separated HTTP methods to accept (e.g. `GET,POST,PUT,DELETE,HEAD,OPTIONS`). Other methods get `405 Method Not Allowed`. |
 | `PROXY_SECURITY_HEADERS` | `false` | If `true`, adds `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy` (and `Strict-Transport-Security` on TLS) to proxied responses unless the backend already set them. |
 | `PROXY_ACCESS_LOG` | `false` | If `true`, logs every request as a structured JSON line (`method`, `path`, `status`, `duration_ms`, `ip`). |
+| `PROXY_BLOCKED_PATHS` | `""` | Comma-separated path prefixes blocked outright with `403` (e.g. `/.env,/.git,/wp-admin`). Matched against the **normalized** path, so `/a/../.env` is caught. |
+| `PROXY_BLOCK_REGEX` | `""` | Regex matched against the raw path+query; matching requests get `403` (e.g. `(?i)union.{0,6}select`). |
+| `PROXY_ALLOWED_HOSTS` | `""` (all) | Comma-separated hostnames the proxy serves (port ignored). Exact (`example.com`) or wildcard (`*.example.com`, subdomains only). Others get `403`. |
+| `PROXY_REQUIRE_UA` | `false` | If `true`, requests without a `User-Agent` header get `403`. |
+| `PROXY_MAX_URI_LEN` | `0` (off) | Maximum path+query length in bytes; longer requests get `414`. |
+| `PROXY_HONEYPOT_PATHS` | `""` | Comma-separated path prefixes that instantly block any client touching them (no legitimate user requests these). |
+| `PROXY_MAX_404_PER_IP` | `0` (off) | Backend 404s a single IP may accumulate in 60 s before being blocked as a scanner. |
+| `PROXY_BASIC_AUTH` | `""` (off) | `user:password` enabling a site-wide HTTP Basic auth gate (staging protection). Constant-time compared. |
+| `PROXY_MAX_CONCURRENT_PER_IP` | `0` (off) | Max concurrent in-flight requests per client IP; excess gets `429`. |
+| `PROXY_MAX_INFLIGHT` | `0` (off) | Global cap on concurrent in-flight requests; excess gets `503`. Also enables the `ddos_proxy_inflight_requests` gauge. |
+| `PROXY_BACKEND_RETRIES` | `0` | Times an idempotent (GET/HEAD) request is retried against the backend after a transport error (max 5). |
+| `PROXY_CB_THRESHOLD` | `0` (off) | Consecutive backend transport failures that trip the circuit breaker (instant `503` instead of waiting on a dead backend). |
+| `PROXY_CB_COOLDOWN` | `30s` | How long the circuit stays open after tripping. |
+| `PROXY_SERVE_STALE` | `false` | If `true` (with `PROXY_CACHE_ENABLED`), an expired cached copy is served when the backend errors, times out, returns 5xx, or the circuit is open. Marked `X-Ddos-Proxy-Cache: STALE`. |
+| `PROXY_REQUEST_ID` | `false` | If `true`, an `X-Request-Id` is generated (or a valid inbound one kept), forwarded to the backend and returned on the response. |
+| `PROXY_ADD_HEADERS` | `""` | Custom response headers, `Name=Value;Name2=Value2`. Overwrite backend values. |
+| `PROXY_REMOVE_HEADERS` | `""` | Comma-separated response headers to strip (e.g. `X-Powered-By`). |
+| `PROXY_CORS_ORIGIN` | `""` (off) | Adds `Access-Control-Allow-Origin` (plus `-Methods`/`-Headers`) to responses unless the backend set them. |
+| `PROXY_COMPRESSION` | `false` | If `true`, gzip-compresses buffered text/JSON/JS/SVG responses ≥ 1 KiB when the client accepts gzip and the backend didn't encode. |
+| `PROXY_POW_DIFFICULTY_ATTACK` | `""` (off) | PoW difficulty issued **while a mitigation window is active** (adaptive hardening; verification accepts the difficulty each client was actually issued). |
+| `PROXY_PATH_RATE_LIMITS` | `""` | Per-path-prefix global req/s limits, e.g. `/login=5,/api=100`. An over-limit prefix is served the JS/PoW challenge without opening a global mitigation window. |
 
 ## Usage
 

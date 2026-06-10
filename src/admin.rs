@@ -6,6 +6,7 @@ use hyper::body::Incoming;
 
 use crate::body::{full, BoxedBody};
 use crate::proxy::ReqCtx;
+use crate::util::ct_eq;
 use crate::waf::Manager;
 
 /// Handle a request routed to the `/admin` prefix.
@@ -98,6 +99,70 @@ pub async fn handle(req: Request<Incoming>, ctx: ReqCtx, manager: Arc<Manager>) 
             ),
         },
 
+        // Clear every tracked IP state.
+        ("DELETE", "/ddos-proxy/admin/states") => {
+            let cleared = manager.clear_states();
+            json(StatusCode::OK, &format!(r#"{{"ok":true,"cleared":{cleared}}}"#))
+        }
+
+        // Force the mitigation window on / off.
+        ("POST", "/ddos-proxy/admin/mitigation") => {
+            manager.set_mitigation(true);
+            json(StatusCode::OK, r#"{"ok":true,"mitigation":true}"#)
+        }
+        ("DELETE", "/ddos-proxy/admin/mitigation") => {
+            manager.set_mitigation(false);
+            json(StatusCode::OK, r#"{"ok":true,"mitigation":false}"#)
+        }
+
+        // Runtime IP deny/trust lists: GET lists, POST adds, DELETE removes.
+        ("GET", "/ddos-proxy/admin/denylist") => {
+            let body = serde_json::to_string(&manager.list_dyn_ips(true))
+                .unwrap_or_else(|_| "[]".to_string());
+            json(StatusCode::OK, &format!(r#"{{"entries":{body}}}"#))
+        }
+        ("GET", "/ddos-proxy/admin/trustlist") => {
+            let body = serde_json::to_string(&manager.list_dyn_ips(false))
+                .unwrap_or_else(|_| "[]".to_string());
+            json(StatusCode::OK, &format!(r#"{{"entries":{body}}}"#))
+        }
+        (m @ ("POST" | "DELETE"), p @ ("/ddos-proxy/admin/denylist" | "/ddos-proxy/admin/trustlist")) => {
+            let deny = p.ends_with("denylist");
+            match read_entry_req(req).await {
+                Some(entry) => {
+                    let ok = if m == "POST" {
+                        manager.add_dyn_ip(deny, &entry)
+                    } else {
+                        manager.remove_dyn_ip(deny, &entry)
+                    };
+                    if ok {
+                        json(StatusCode::OK, r#"{"ok":true}"#)
+                    } else {
+                        json(
+                            StatusCode::BAD_REQUEST,
+                            r#"{"error":"invalid or unknown IP/CIDR entry"}"#,
+                        )
+                    }
+                }
+                None => json(
+                    StatusCode::BAD_REQUEST,
+                    r#"{"error":"expected JSON {\"entry\":\"1.2.3.4/32\"}"}"#,
+                ),
+            }
+        }
+
+        // Wipe the disk cache.
+        ("DELETE", "/ddos-proxy/admin/cache") => match manager.purge_cache() {
+            Some(removed) => json(StatusCode::OK, &format!(r#"{{"ok":true,"removed":{removed}}}"#)),
+            None => json(StatusCode::BAD_REQUEST, r#"{"error":"cache is disabled"}"#),
+        },
+
+        // Redacted view of the running configuration.
+        ("GET", "/ddos-proxy/admin/config") => {
+            let body = config_json(&manager);
+            json(StatusCode::OK, &body)
+        }
+
         // Maintenance mode: GET reads, POST enables, DELETE disables.
         ("GET", "/ddos-proxy/admin/maintenance") => {
             let body = format!(r#"{{"maintenance":{}}}"#, manager.maintenance_active());
@@ -146,6 +211,86 @@ struct BlockReq {
     host: String,
 }
 
+#[derive(serde::Deserialize)]
+struct EntryReq {
+    entry: String,
+}
+
+/// Read a `{"entry":"..."}` body (runtime deny/trust list management).
+async fn read_entry_req(req: Request<Incoming>) -> Option<String> {
+    let bytes = Limited::new(req.into_body(), 64 * 1024)
+        .collect()
+        .await
+        .ok()?
+        .to_bytes();
+    let e: EntryReq = serde_json::from_slice(&bytes).ok()?;
+    if e.entry.is_empty() {
+        return None;
+    }
+    Some(e.entry)
+}
+
+/// Redacted JSON view of the running configuration. Secrets are reported only
+/// as set/unset so the endpoint can't leak credentials.
+fn config_json(manager: &Manager) -> String {
+    let c = manager.config();
+    serde_json::json!({
+        "backend_url": c.backend_url,
+        "port": c.port,
+        "max_req_per_sec": c.max_req_per_sec,
+        "max_conn_per_sec": c.max_conn_per_sec,
+        "max_req_per_ip": c.max_req_per_ip,
+        "verify_time_secs": c.verify_time.as_secs(),
+        "mitigation_time_secs": c.mitigation_time.as_secs(),
+        "always_on": c.always_on,
+        "cookie_challenge": c.cookie_challenge,
+        "pow_difficulty": c.pow_difficulty,
+        "pow_difficulty_attack": c.pow_difficulty_attack,
+        "turnstile_configured": !c.turnstile_secret_key.is_empty(),
+        "block_action": c.block_action,
+        "max_failed_challenges": c.max_failed_challenges,
+        "use_forwarded_for": c.use_forwarded_for,
+        "cloudflare_support": c.cloudflare_support,
+        "prometheus_enabled": c.prometheus_enabled,
+        "cache_enabled": c.cache_enabled,
+        "serve_stale": c.serve_stale,
+        "enable_ssl": c.enable_ssl,
+        "xdp_interface": c.xdp_interface,
+        "discord_alerts": c.discord_webhook_url.is_some(),
+        "max_ip_states": c.max_ip_states,
+        "max_inflight": c.max_inflight,
+        "max_concurrent_per_ip": c.max_concurrent_per_ip,
+        "backend_timeout_secs": c.backend_timeout.as_secs(),
+        "backend_retries": c.backend_retries,
+        "cb_threshold": c.cb_threshold,
+        "cb_cooldown_secs": c.cb_cooldown.as_secs(),
+        "max_body_size": c.max_body_size,
+        "max_uri_len": c.max_uri_len,
+        "allowed_methods": c.allowed_methods,
+        "allowed_hosts": c.allowed_hosts,
+        "blocked_paths": c.blocked_paths,
+        "honeypot_paths": c.honeypot_paths,
+        "exempt_paths": c.exempt_paths,
+        "blocked_ua": c.blocked_ua,
+        "whitelisted_ua": c.whitelisted_ua,
+        "block_regex": c.block_regex.as_ref().map(|r| r.as_str()),
+        "path_rate_limits": c.path_rate_limits,
+        "max_404_per_ip": c.max_404_per_ip,
+        "require_ua": c.require_ua,
+        "basic_auth_enabled": c.basic_auth.is_some(),
+        "security_headers": c.security_headers,
+        "compression": c.compression,
+        "request_id": c.request_id,
+        "access_log": c.access_log,
+        "cors_origin": c.cors_origin,
+        "add_headers": c.add_headers,
+        "remove_headers": c.remove_headers,
+        "trusted_ips_configured": c.trusted_ips.len(),
+        "deny_ips_configured": c.deny_ips.len(),
+    })
+    .to_string()
+}
+
 async fn read_block_req(req: Request<Incoming>) -> Option<(String, String)> {
     // Cap the body: the JSON payload is tiny, so anything larger is abuse.
     let bytes = Limited::new(req.into_body(), 64 * 1024)
@@ -160,18 +305,6 @@ async fn read_block_req(req: Request<Incoming>) -> Option<(String, String)> {
     Some((b.ip, b.host))
 }
 
-/// Constant-time byte-slice equality. Returns false fast on length mismatch
-/// (the token length is not secret), otherwise compares every byte.
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
 
 /// Minimal percent-decoding for the path segment after `/admin/states/`.
 fn percent_decode(s: &str) -> String {
@@ -528,6 +661,27 @@ mod tests {
             allowed_methods: vec![],
             security_headers: false,
             access_log: false,
+            blocked_paths: vec![],
+            block_regex: None,
+            allowed_hosts: vec![],
+            require_ua: false,
+            max_uri_len: None,
+            honeypot_paths: vec![],
+            max_404_per_ip: None,
+            basic_auth: None,
+            max_concurrent_per_ip: None,
+            max_inflight: None,
+            backend_retries: 0,
+            cb_threshold: 0,
+            cb_cooldown: Duration::from_secs(30),
+            serve_stale: false,
+            request_id: false,
+            add_headers: vec![],
+            remove_headers: vec![],
+            cors_origin: None,
+            compression: false,
+            pow_difficulty_attack: None,
+            path_rate_limits: vec![],
         });
         let rl = Arc::new(RateLimiter::new());
         let target: http::Uri = "http://127.0.0.1:8081".parse().unwrap();
@@ -603,6 +757,60 @@ mod tests {
         manager.set_maintenance(false);
         assert!(!manager.maintenance_active());
         assert!(!manager.get_status().maintenance_active);
+    }
+
+    #[tokio::test]
+    async fn clear_states_removes_everything() {
+        let manager = make_manager(Some("secret"));
+        manager.manual_block("1.1.1.1", "a.com");
+        manager.manual_block("2.2.2.2", "b.com");
+        assert_eq!(manager.list_states().len(), 2);
+        let cleared = manager.clear_states();
+        assert_eq!(cleared, 2);
+        assert!(manager.list_states().is_empty());
+    }
+
+    #[tokio::test]
+    async fn mitigation_force_toggle() {
+        let manager = make_manager(Some("secret"));
+        assert!(!manager.get_status().mitigation_active);
+        manager.set_mitigation(true);
+        assert!(manager.get_status().mitigation_active);
+        manager.set_mitigation(false);
+        assert!(!manager.get_status().mitigation_active);
+    }
+
+    #[tokio::test]
+    async fn dyn_ip_lists_add_list_remove() {
+        let manager = make_manager(Some("secret"));
+        assert!(manager.add_dyn_ip(true, "10.0.0.0/8"));
+        assert!(manager.add_dyn_ip(false, "192.168.1.1"));
+        assert!(!manager.add_dyn_ip(true, "not-an-ip"));
+        assert_eq!(manager.list_dyn_ips(true), vec!["10.0.0.0/8"]);
+        assert_eq!(manager.list_dyn_ips(false), vec!["192.168.1.1"]);
+        // Duplicate add is a no-op.
+        assert!(manager.add_dyn_ip(true, "10.0.0.0/8"));
+        assert_eq!(manager.list_dyn_ips(true).len(), 1);
+        assert!(manager.remove_dyn_ip(true, "10.0.0.0/8"));
+        assert!(!manager.remove_dyn_ip(true, "10.0.0.0/8"));
+        assert!(manager.list_dyn_ips(true).is_empty());
+    }
+
+    #[tokio::test]
+    async fn status_reports_uptime_and_version() {
+        let manager = make_manager(Some("secret"));
+        let s = manager.get_status();
+        assert!(s.uptime_secs >= 0);
+        assert_eq!(s.version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn config_json_redacts_secrets() {
+        let manager = make_manager(Some("secret"));
+        let body = config_json(&manager);
+        assert!(!body.contains("secret"));
+        assert!(body.contains("\"backend_url\""));
+        assert!(body.contains("\"basic_auth_enabled\":false"));
     }
 
     #[tokio::test]

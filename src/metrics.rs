@@ -251,6 +251,67 @@ pub static IP_STATES_CAP_HITS: Lazy<IntCounter> = Lazy::new(|| {
     c
 });
 
+/// Requests currently being handled (incremented at WAF entry, decremented when
+/// the response is produced). Only tracked when `PROXY_MAX_INFLIGHT` is set.
+pub static INFLIGHT_REQUESTS: Lazy<IntGauge> = Lazy::new(|| {
+    let g = IntGauge::new(
+        "ddos_proxy_inflight_requests",
+        "Requests currently in flight through the proxy (tracked when PROXY_MAX_INFLIGHT is set)",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(g.clone())).unwrap();
+    g
+});
+
+/// Currently verified client states, updated every 10 s by the cleanup ticker.
+pub static VERIFIED_CLIENTS: Lazy<IntGauge> = Lazy::new(|| {
+    let g = IntGauge::new(
+        "ddos_proxy_verified_clients_current",
+        "Currently verified client states (challenge solved, within verify window)",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(g.clone())).unwrap();
+    g
+});
+
+/// Disk-cache outcomes: `hit` (fresh entry served), `miss` (cacheable GET with
+/// no fresh entry), `store` (response written to cache), `stale` (expired entry
+/// served because the backend failed).
+pub static CACHE_REQUESTS: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "ddos_proxy_cache_requests_total",
+            "Disk cache outcomes, by result (hit, miss, store, stale)",
+        ),
+        &["result"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).unwrap();
+    c
+});
+
+/// Idempotent backend requests retried after a transport error.
+pub static BACKEND_RETRIES: Lazy<IntCounter> = Lazy::new(|| {
+    let c = IntCounter::new(
+        "ddos_proxy_backend_retries_total",
+        "Idempotent (GET/HEAD) backend requests retried after a transport error",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).unwrap();
+    c
+});
+
+/// Requests served the challenge because a per-path rate limit was exceeded.
+pub static PATH_RATE_LIMITED: Lazy<IntCounter> = Lazy::new(|| {
+    let c = IntCounter::new(
+        "ddos_proxy_path_rate_limited_total",
+        "Requests served a WAF challenge because a PROXY_PATH_RATE_LIMITS prefix was over its limit",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).unwrap();
+    c
+});
+
 /// Initialise counters to 0 so they appear in metrics output immediately,
 /// matching the Go `init()` behaviour.
 pub fn init() {
@@ -270,12 +331,30 @@ pub fn init() {
         "method_not_allowed",
         "body_too_large",
         "maintenance",
+        "blocked_path",
+        "block_regex",
+        "host_not_allowed",
+        "no_user_agent",
+        "uri_too_long",
+        "honeypot",
+        "basic_auth",
+        "inflight_cap",
+        "per_ip_concurrency",
+        "scanner_404",
+        "circuit_open",
     ] {
         DROPPED_REQUESTS.with_label_values(&[reason]).inc_by(0);
     }
     for reason in ["trusted_ip", "exempt_path"] {
         ALLOWED_REQUESTS.with_label_values(&[reason]).inc_by(0);
     }
+    for result in ["hit", "miss", "store", "stale"] {
+        CACHE_REQUESTS.with_label_values(&[result]).inc_by(0);
+    }
+    let _ = &*INFLIGHT_REQUESTS;
+    let _ = &*VERIFIED_CLIENTS;
+    let _ = &*BACKEND_RETRIES;
+    let _ = &*PATH_RATE_LIMITED;
     XDP_PACKETS.with_label_values(&["allowed"]).inc_by(0);
     XDP_PACKETS.with_label_values(&["blocked"]).inc_by(0);
     for reason in [
@@ -371,6 +450,31 @@ pub fn per_ip_rate_limited() {
 /// Increment the verify-endpoint rate limit counter.
 pub fn verify_rate_limited() {
     VERIFY_RATE_LIMITED.inc();
+}
+
+/// Update the in-flight requests gauge.
+pub fn set_inflight(count: i64) {
+    INFLIGHT_REQUESTS.set(count.max(0));
+}
+
+/// Update the verified-clients gauge (computed by the cleanup ticker).
+pub fn set_verified_clients(count: i64) {
+    VERIFIED_CLIENTS.set(count.max(0));
+}
+
+/// Record a cache outcome: `"hit"`, `"miss"`, `"store"`, or `"stale"`.
+pub fn cache_result(result: &str) {
+    CACHE_REQUESTS.with_label_values(&[result]).inc();
+}
+
+/// Record one retried backend request.
+pub fn backend_retry() {
+    BACKEND_RETRIES.inc();
+}
+
+/// Increment the per-path rate limit counter.
+pub fn path_rate_limited() {
+    PATH_RATE_LIMITED.inc();
 }
 
 /// Record `count` challenges that were abandoned (client state evicted before solve).

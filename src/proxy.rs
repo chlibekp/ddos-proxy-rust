@@ -70,6 +70,10 @@ pub struct Proxy {
     /// (which is unauthenticated and WAF-exempt) can't amplify into a flood of
     /// backend probes.
     health_cache: std::sync::Mutex<Option<(std::time::Instant, HealthOutcome)>>,
+    /// Circuit breaker: consecutive backend transport failures (reset on any
+    /// successful response) and the unix second until which the circuit is open.
+    cb_failures: std::sync::atomic::AtomicI64,
+    cb_open_until: std::sync::atomic::AtomicI64,
 }
 
 impl Proxy {
@@ -108,7 +112,47 @@ impl Proxy {
             client,
             cache,
             health_cache: std::sync::Mutex::new(None),
+            cb_failures: std::sync::atomic::AtomicI64::new(0),
+            cb_open_until: std::sync::atomic::AtomicI64::new(0),
         }
+    }
+
+    /// Wipe the disk cache. Returns the number of entries removed, or `None`
+    /// when caching is disabled.
+    pub fn purge_cache(&self) -> Option<usize> {
+        self.cache.as_ref().map(|c| c.purge())
+    }
+
+    /// Record a backend transport failure for the circuit breaker; trips the
+    /// circuit (fail-fast 503s) once `cb_threshold` consecutive failures accrue.
+    fn cb_record_failure(&self) {
+        if self.cfg.cb_threshold <= 0 {
+            return;
+        }
+        use std::sync::atomic::Ordering;
+        let failures = self.cb_failures.fetch_add(1, Ordering::SeqCst) + 1;
+        if failures >= self.cfg.cb_threshold {
+            let open_until = unix_now() + self.cfg.cb_cooldown.as_secs() as i64;
+            self.cb_open_until.store(open_until, Ordering::SeqCst);
+            self.cb_failures.store(0, Ordering::SeqCst);
+            tracing::warn!(
+                failures = failures,
+                cooldown_secs = self.cfg.cb_cooldown.as_secs(),
+                "Circuit breaker opened: failing fast on backend requests"
+            );
+        }
+    }
+
+    fn cb_record_success(&self) {
+        if self.cfg.cb_threshold > 0 {
+            self.cb_failures.store(0, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Whether the circuit breaker is currently open (backend known bad).
+    fn cb_is_open(&self) -> bool {
+        self.cfg.cb_threshold > 0
+            && unix_now() < self.cb_open_until.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Probes the backend by sending a HEAD request to `path` with a 5-second
@@ -161,9 +205,46 @@ impl Proxy {
         result
     }
 
-    /// Main proxy entry point. Forwards `req` to the backend, applying the same
-    /// header manipulation, JS injection and caching behaviour as the Go proxy.
-    pub async fn handle(&self, req: Request<Incoming>, ctx: &ReqCtx) -> Response<BoxedBody> {
+    /// Main proxy entry point. Handles `X-Request-Id` generation/propagation
+    /// (inserted into the inbound headers so it is forwarded upstream, and set
+    /// on whatever response is produced), then delegates to `handle_inner`.
+    pub async fn handle(&self, mut req: Request<Incoming>, ctx: &ReqCtx) -> Response<BoxedBody> {
+        let req_id = if self.cfg.request_id {
+            let inbound = req
+                .headers()
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok())
+                .filter(|s| {
+                    !s.is_empty()
+                        && s.len() <= 128
+                        && s.bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+                })
+                .map(|s| s.to_string());
+            let id = inbound.unwrap_or_else(random_request_id);
+            if let Ok(hv) = HeaderValue::from_str(&id) {
+                req.headers_mut()
+                    .insert(HeaderName::from_static("x-request-id"), hv);
+            }
+            Some(id)
+        } else {
+            None
+        };
+
+        let mut resp = self.handle_inner(req, ctx).await;
+
+        if let Some(id) = req_id {
+            if let Ok(hv) = HeaderValue::from_str(&id) {
+                resp.headers_mut()
+                    .insert(HeaderName::from_static("x-request-id"), hv);
+            }
+        }
+        resp
+    }
+
+    /// Forwards `req` to the backend, applying the same header manipulation,
+    /// JS injection and caching behaviour as the Go proxy.
+    async fn handle_inner(&self, req: Request<Incoming>, ctx: &ReqCtx) -> Response<BoxedBody> {
         if is_websocket_upgrade(&req) {
             return self.handle_websocket(req, ctx).await;
         }
@@ -175,13 +256,43 @@ impl Proxy {
         } else {
             None
         };
+        let accept_gzip = req
+            .headers()
+            .get(http::header::ACCEPT_ENCODING)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.contains("gzip"))
+            .unwrap_or(false);
 
         // Cache hit fast-path.
         if let (Some(cache), Some(key)) = (self.cache.as_ref(), cache_key.as_ref()) {
             if let Some(stored) = cache.get_fresh(key) {
+                if self.cfg.prometheus_enabled {
+                    crate::metrics::cache_result("hit");
+                }
                 let resp = stored.into_response();
-                return self.modify_response(resp, &req, ctx, CacheStatus::Hit).await;
+                let meta = InboundMeta {
+                    host: String::new(),
+                    accept_gzip,
+                };
+                return self
+                    .modify_response_buffered(resp, &meta, ctx, CacheStatus::Hit)
+                    .await;
             }
+            if self.cfg.prometheus_enabled {
+                crate::metrics::cache_result("miss");
+            }
+        }
+
+        // Circuit breaker: while open, fail fast instead of hammering a backend
+        // that is known to be down (serving stale cache if allowed).
+        if self.cb_is_open() {
+            if self.cfg.prometheus_enabled {
+                crate::metrics::dropped("circuit_open");
+            }
+            if let Some(resp) = self.try_serve_stale(&cache_key, ctx, accept_gzip).await {
+                return resp;
+            }
+            return error_response(StatusCode::SERVICE_UNAVAILABLE, "Service Temporarily Unavailable");
         }
 
         // Build the outbound request.
@@ -192,39 +303,88 @@ impl Proxy {
         };
         let inbound_meta = InboundMeta {
             host: original_host,
+            accept_gzip,
         };
+
+        // Retry support: GET/HEAD are idempotent, so a transport error (likely a
+        // dead pooled connection or a momentary backend blip) can be retried with
+        // a rebuilt request. The retry uses an empty body — bodies on GET/HEAD
+        // are vanishingly rare and not forwarded on retry.
+        let retriable = self.cfg.backend_retries > 0
+            && (method == Method::GET || method == Method::HEAD);
+        let (out_parts, out_body) = outbound.into_parts();
+        let saved_parts = if retriable { Some(out_parts.clone()) } else { None };
+        let mut current = Request::from_parts(out_parts, out_body);
 
         // Send to backend, bounded by PROXY_BACKEND_TIMEOUT (time to first
         // response headers). A hung backend otherwise pins request tasks open
         // indefinitely, which is itself a DoS amplifier.
         let req_start = std::time::Instant::now();
-        let upstream_result = if self.cfg.backend_timeout.is_zero() {
-            Ok(self.client.request(outbound).await)
-        } else {
-            tokio::time::timeout(self.cfg.backend_timeout, self.client.request(outbound)).await
+        let mut attempt: u32 = 0;
+        let upstream = loop {
+            let upstream_result = if self.cfg.backend_timeout.is_zero() {
+                Ok(self.client.request(current).await)
+            } else {
+                tokio::time::timeout(self.cfg.backend_timeout, self.client.request(current)).await
+            };
+            match upstream_result {
+                Err(_) => {
+                    tracing::error!(
+                        timeout_secs = self.cfg.backend_timeout.as_secs(),
+                        "Backend request timed out"
+                    );
+                    self.cb_record_failure();
+                    if self.cfg.prometheus_enabled {
+                        crate::metrics::backend_response("timeout");
+                        crate::metrics::backend_duration(req_start.elapsed().as_secs_f64());
+                    }
+                    if let Some(resp) = self.try_serve_stale(&cache_key, ctx, accept_gzip).await {
+                        return resp;
+                    }
+                    return error_response(StatusCode::GATEWAY_TIMEOUT, "Gateway Timeout");
+                }
+                Ok(Err(e)) => {
+                    if let Some(parts) = &saved_parts {
+                        if attempt < self.cfg.backend_retries {
+                            attempt += 1;
+                            tracing::warn!(error = %e, attempt = attempt, "Retrying backend request");
+                            if self.cfg.prometheus_enabled {
+                                crate::metrics::backend_retry();
+                            }
+                            current = Request::from_parts(parts.clone(), empty());
+                            continue;
+                        }
+                    }
+                    tracing::error!(error = %e, "Proxy error");
+                    self.cb_record_failure();
+                    if self.cfg.prometheus_enabled {
+                        crate::metrics::backend_response("error");
+                        crate::metrics::backend_duration(req_start.elapsed().as_secs_f64());
+                    }
+                    if let Some(resp) = self.try_serve_stale(&cache_key, ctx, accept_gzip).await {
+                        return resp;
+                    }
+                    return error_response(StatusCode::BAD_GATEWAY, "Bad Gateway");
+                }
+                Ok(Ok(r)) => {
+                    self.cb_record_success();
+                    break r;
+                }
+            }
         };
-        let upstream = match upstream_result {
-            Err(_) => {
-                tracing::error!(
-                    timeout_secs = self.cfg.backend_timeout.as_secs(),
-                    "Backend request timed out"
-                );
+
+        // Serve-stale on backend 5xx: a stale cached page beats an error page.
+        if self.cfg.serve_stale && upstream.status().is_server_error() {
+            if let Some(resp) = self.try_serve_stale(&cache_key, ctx, accept_gzip).await {
                 if self.cfg.prometheus_enabled {
-                    crate::metrics::backend_response("timeout");
+                    crate::metrics::backend_response(crate::metrics::status_class(
+                        upstream.status().as_u16(),
+                    ));
                     crate::metrics::backend_duration(req_start.elapsed().as_secs_f64());
                 }
-                return error_response(StatusCode::GATEWAY_TIMEOUT, "Gateway Timeout");
+                return resp;
             }
-            Ok(Err(e)) => {
-                tracing::error!(error = %e, "Proxy error");
-                if self.cfg.prometheus_enabled {
-                    crate::metrics::backend_response("error");
-                    crate::metrics::backend_duration(req_start.elapsed().as_secs_f64());
-                }
-                return error_response(StatusCode::BAD_GATEWAY, "Bad Gateway");
-            }
-            Ok(Ok(r)) => r,
-        };
+        }
 
         // Convert to buffered form when we may store or inject; otherwise stream.
         let status = upstream.status();
@@ -257,6 +417,9 @@ impl Proxy {
             if storable {
                 if let (Some(cache), Some(key)) = (self.cache.as_ref(), cache_key.as_ref()) {
                     cache.put(key, status, &parts.headers, &collected);
+                    if self.cfg.prometheus_enabled {
+                        crate::metrics::cache_result("store");
+                    }
                 }
             }
 
@@ -345,6 +508,12 @@ impl Proxy {
             .trim_matches(|c| c == '[' || c == ']');
         append_xff(&mut parts.headers, client_ip);
 
+        // X-Real-IP: always set (overwriting any inbound value, which would
+        // otherwise let clients spoof their address to the backend).
+        if let Ok(hv) = HeaderValue::from_str(client_ip) {
+            parts.headers.insert(HeaderName::from_static("x-real-ip"), hv);
+        }
+
         // X-Forwarded-Host / X-Forwarded-Proto if absent.
         if !parts.headers.contains_key("x-forwarded-host") {
             if let Ok(hv) = HeaderValue::from_str(original_host) {
@@ -366,21 +535,31 @@ impl Proxy {
         Ok(Request::from_parts(parts, boxed))
     }
 
-    async fn modify_response(
+    /// Serve a stale cached copy of `cache_key` if serve-stale is enabled and an
+    /// entry (fresh or expired) exists. Returns `None` when not applicable.
+    async fn try_serve_stale(
         &self,
-        resp: Response<BoxedBody>,
-        _req: &Request<Incoming>,
+        cache_key: &Option<String>,
         ctx: &ReqCtx,
-        cache_status: CacheStatus,
-    ) -> Response<BoxedBody> {
-        // Used for cache-hit path: body already buffered inside resp.
-        let host = ctx.remote_addr.clone(); // not used for location here
-        let _ = host;
+        accept_gzip: bool,
+    ) -> Option<Response<BoxedBody>> {
+        if !self.cfg.serve_stale {
+            return None;
+        }
+        let (cache, key) = (self.cache.as_ref()?, cache_key.as_ref()?);
+        let stored = cache.get_any(key)?;
+        tracing::warn!("Backend unavailable; serving stale cached response");
+        if self.cfg.prometheus_enabled {
+            crate::metrics::cache_result("stale");
+        }
         let meta = InboundMeta {
             host: String::new(),
+            accept_gzip,
         };
-        self.modify_response_buffered(resp, &meta, ctx, cache_status)
-            .await
+        Some(
+            self.modify_response_buffered(stored.into_response(), &meta, ctx, CacheStatus::Stale)
+                .await,
+        )
     }
 
     /// Apply response transforms when the body is already buffered (HTML/cache).
@@ -442,11 +621,51 @@ impl Proxy {
                 HeaderValue::from_str(&len.to_string()).unwrap(),
             );
             strip_hop_by_hop(&mut parts.headers);
-            return Response::from_parts(parts, full(Bytes::from(injected)));
+            let body = self.maybe_compress(&mut parts.headers, &content_type, meta, Bytes::from(injected));
+            return Response::from_parts(parts, full(body));
         }
 
         strip_hop_by_hop(&mut parts.headers);
-        Response::from_parts(parts, full(bytes))
+        let body = self.maybe_compress(&mut parts.headers, &content_type, meta, bytes);
+        Response::from_parts(parts, full(body))
+    }
+
+    /// Optionally gzip a buffered response body: only when compression is
+    /// enabled, the client accepts gzip, the content type is compressible, the
+    /// body is ≥ 1 KiB, the backend didn't already encode it, and compressing
+    /// actually shrinks it. Updates Content-Encoding/Content-Length/Vary.
+    fn maybe_compress(
+        &self,
+        headers: &mut HeaderMap,
+        content_type: &str,
+        meta: &InboundMeta,
+        body: Bytes,
+    ) -> Bytes {
+        const MIN_COMPRESS_LEN: usize = 1024;
+        if !self.cfg.compression
+            || !meta.accept_gzip
+            || body.len() < MIN_COMPRESS_LEN
+            || !compressible_content_type(content_type)
+            || headers.contains_key(http::header::CONTENT_ENCODING)
+        {
+            return body;
+        }
+        let Some(gz) = encode_gzip(&body) else {
+            return body;
+        };
+        if gz.len() >= body.len() {
+            return body;
+        }
+        headers.insert(
+            http::header::CONTENT_ENCODING,
+            HeaderValue::from_static("gzip"),
+        );
+        headers.insert(
+            http::header::CONTENT_LENGTH,
+            HeaderValue::from_str(&gz.len().to_string()).unwrap(),
+        );
+        headers.append(http::header::VARY, HeaderValue::from_static("Accept-Encoding"));
+        Bytes::from(gz)
     }
 
     /// Apply response transforms for the streaming (non-HTML, non-cached) path.
@@ -516,11 +735,46 @@ impl Proxy {
                 }
             }
             CacheStatus::Disabled => "DYNAMIC",
+            CacheStatus::Stale => "STALE",
         };
         headers.insert(
             HeaderName::from_static("x-ddos-proxy-cache"),
             HeaderValue::from_static(value),
         );
+
+        // CORS injection: only when configured and the backend didn't set it.
+        if let Some(origin) = &self.cfg.cors_origin {
+            if !headers.contains_key(http::header::ACCESS_CONTROL_ALLOW_ORIGIN) {
+                if let Ok(hv) = HeaderValue::from_str(origin) {
+                    headers.insert(http::header::ACCESS_CONTROL_ALLOW_ORIGIN, hv);
+                    headers.insert(
+                        http::header::ACCESS_CONTROL_ALLOW_METHODS,
+                        HeaderValue::from_static("GET, POST, PUT, DELETE, PATCH, OPTIONS"),
+                    );
+                    headers.insert(
+                        http::header::ACCESS_CONTROL_ALLOW_HEADERS,
+                        HeaderValue::from_static("Content-Type, Authorization"),
+                    );
+                    if origin != "*" {
+                        headers.append(http::header::VARY, HeaderValue::from_static("Origin"));
+                    }
+                }
+            }
+        }
+
+        // Operator-configured header stripping (e.g. hide X-Powered-By) and
+        // custom additions; additions overwrite backend values by design.
+        for name in &self.cfg.remove_headers {
+            headers.remove(name.as_str());
+        }
+        for (name, value) in &self.cfg.add_headers {
+            if let (Ok(n), Ok(v)) = (
+                HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(value),
+            ) {
+                headers.insert(n, v);
+            }
+        }
     }
 
     fn rewrite_location(&self, headers: &mut HeaderMap, meta: &InboundMeta, ctx: &ReqCtx) {
@@ -605,6 +859,9 @@ impl Proxy {
             .map(|(h, _)| h)
             .unwrap_or(&ctx.remote_addr);
         append_xff(&mut parts.headers, client_ip);
+        if let Ok(hv) = HeaderValue::from_str(client_ip.trim_matches(|c| c == '[' || c == ']')) {
+            parts.headers.insert(HeaderName::from_static("x-real-ip"), hv);
+        }
 
         let out_uri: Uri = match joined.parse() {
             Ok(u) => u,
@@ -674,6 +931,9 @@ impl Proxy {
 
 struct InboundMeta {
     host: String,
+    /// Whether the inbound request advertised `Accept-Encoding: gzip` (used by
+    /// the optional response-compression feature).
+    accept_gzip: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -681,6 +941,8 @@ enum CacheStatus {
     Hit,
     FreshFetch,
     Disabled,
+    /// Expired cache entry served because the backend failed (serve-stale).
+    Stale,
 }
 
 fn host_header<B>(req: &Request<B>) -> Option<String> {
@@ -767,6 +1029,31 @@ fn decode_gzip(data: &[u8]) -> Option<Vec<u8>> {
     let mut decoder = flate2::read::GzDecoder::new(data);
     let mut out = Vec::new();
     decoder.read_to_end(&mut out).ok().map(|_| out)
+}
+
+fn encode_gzip(data: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Write;
+    let mut encoder =
+        flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(data).ok()?;
+    encoder.finish().ok()
+}
+
+/// Content types worth gzip-compressing (text-like payloads).
+fn compressible_content_type(ct: &str) -> bool {
+    ct.starts_with("text/")
+        || ct.starts_with("application/json")
+        || ct.starts_with("application/javascript")
+        || ct.starts_with("application/xml")
+        || ct.starts_with("image/svg")
+}
+
+/// Random 16-byte hex request ID.
+fn random_request_id() -> String {
+    use rand::RngCore;
+    let mut b = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut b);
+    hex::encode(b)
 }
 
 pub fn normalize_cache_control(value: &str) -> String {

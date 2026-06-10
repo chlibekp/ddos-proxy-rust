@@ -20,8 +20,9 @@ use crate::config::Config;
 use crate::discord::DiscordAlerter;
 use crate::limiter::RateLimiter;
 use crate::metrics;
+use crate::netmatch::IpCidr;
 use crate::proxy::{Proxy, ReqCtx};
-use crate::util::{is_websocket_upgrade, now_millis, now_unix};
+use crate::util::{ct_eq, is_websocket_upgrade, normalize_path, now_millis, now_unix};
 use crate::xdp::Blocker;
 
 pub struct Manager {
@@ -41,6 +42,18 @@ pub struct Manager {
     timeout_count: AtomicI64,
     ip_states: DashMap<String, Arc<ClientState>>,
     ip_state_count: AtomicI64,
+    /// Requests currently in flight through the WAF (tracked when
+    /// `PROXY_MAX_INFLIGHT` is set; drives the inflight gauge and global cap).
+    inflight: Arc<AtomicI64>,
+    /// Runtime-managed IP deny/trust lists (admin API), checked alongside the
+    /// static `PROXY_DENY_IPS` / `PROXY_TRUSTED_IPS` config lists. Entries keep
+    /// their original string form for listing and removal.
+    dyn_deny: std::sync::RwLock<Vec<(String, IpCidr)>>,
+    dyn_trust: std::sync::RwLock<Vec<(String, IpCidr)>>,
+    /// Per-path rate-limit counters, aligned with `cfg.path_rate_limits`.
+    path_rates: Vec<PathRate>,
+    /// Unix second the manager started (for uptime reporting).
+    started_at_unix: i64,
     /// Shared HTTP client for Turnstile siteverify calls. Built once and reused so
     /// every challenge verification doesn't spin up a fresh connection pool, and a
     /// bounded timeout keeps a slow/hung Turnstile endpoint from pinning request
@@ -52,6 +65,35 @@ pub struct Manager {
 /// carries only a nonce/token plus a short URL, so anything larger is abuse;
 /// capping it stops an attacker from forcing the proxy to buffer huge bodies.
 const MAX_VERIFY_BODY: usize = 64 * 1024;
+
+/// Per-second counter for one `PROXY_PATH_RATE_LIMITS` prefix.
+struct PathRate {
+    prefix: String,
+    limit: i64,
+    window: AtomicI64,
+    count: AtomicI64,
+}
+
+/// Decrements the wrapped counter on drop and refreshes the inflight gauge.
+/// Held for the lifetime of a request to track global in-flight count.
+struct CounterGuard(Arc<AtomicI64>);
+
+impl Drop for CounterGuard {
+    fn drop(&mut self) {
+        let v = self.0.fetch_sub(1, Ordering::SeqCst) - 1;
+        metrics::set_inflight(v);
+    }
+}
+
+/// Decrements the per-client in-flight counter on drop
+/// (`PROXY_MAX_CONCURRENT_PER_IP`).
+struct StateInflightGuard(Arc<ClientState>);
+
+impl Drop for StateInflightGuard {
+    fn drop(&mut self) {
+        self.0.inflight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 impl Manager {
     pub fn new(
@@ -66,6 +108,17 @@ impl Manager {
         env.add_template_owned("challenge.html", template_src)
             .expect("invalid challenge template");
 
+        let path_rates = cfg
+            .path_rate_limits
+            .iter()
+            .map(|(prefix, limit)| PathRate {
+                prefix: prefix.clone(),
+                limit: *limit,
+                window: AtomicI64::new(0),
+                count: AtomicI64::new(0),
+            })
+            .collect();
+
         let manager = Arc::new(Manager {
             cfg,
             rl,
@@ -73,6 +126,11 @@ impl Manager {
             xdp,
             proxy,
             alerter,
+            inflight: Arc::new(AtomicI64::new(0)),
+            dyn_deny: std::sync::RwLock::new(Vec::new()),
+            dyn_trust: std::sync::RwLock::new(Vec::new()),
+            path_rates,
+            started_at_unix: now_unix(),
             mitigation_until: AtomicI64::new(0),
             mitigation_started_at: AtomicI64::new(0),
             js_challenge_until: AtomicI64::new(0),
@@ -207,6 +265,7 @@ impl Manager {
         // Eviction reason counters for Prometheus.
         let mut evicted_mitigation_ended: u64 = 0;
         let mut evicted_idle: u64 = 0;
+        let mut verified_count: i64 = 0;
 
         for entry in self.ip_states.iter() {
             let key = entry.key().clone();
@@ -217,6 +276,9 @@ impl Manager {
             if inner.verified && now_ms - inner.verified_at_ms > verify_ms {
                 inner.verified = false;
                 state.verified_flag.store(false, Ordering::SeqCst);
+            }
+            if inner.verified {
+                verified_count += 1;
             }
 
             if attack_ended && !self.cfg.always_on && !inner.verified {
@@ -264,6 +326,7 @@ impl Manager {
 
         if self.prom() {
             metrics::set_ip_states(self.ip_state_count.load(Ordering::SeqCst));
+            metrics::set_verified_clients(verified_count);
             if abandoned > 0 {
                 metrics::challenge_abandoned(abandoned);
             }
@@ -298,19 +361,116 @@ impl Manager {
         count > max
     }
 
-    fn render_challenge(&self, err: &str, site_key: &str, original_url: &str, salt: &str) -> String {
+    /// Whether `ip` is denied by the static config list or the runtime list.
+    fn ip_denied(&self, ip: &str) -> bool {
+        if crate::netmatch::ip_in_list(ip, &self.cfg.deny_ips) {
+            return true;
+        }
+        let list = self.dyn_deny.read().unwrap();
+        if list.is_empty() {
+            return false;
+        }
+        let Ok(addr) = ip.parse::<std::net::IpAddr>() else {
+            return false;
+        };
+        list.iter().any(|(_, c)| c.contains(addr))
+    }
+
+    /// Whether `ip` is trusted by the static config list or the runtime list.
+    fn ip_trusted(&self, ip: &str) -> bool {
+        if crate::netmatch::ip_in_list(ip, &self.cfg.trusted_ips) {
+            return true;
+        }
+        let list = self.dyn_trust.read().unwrap();
+        if list.is_empty() {
+            return false;
+        }
+        let Ok(addr) = ip.parse::<std::net::IpAddr>() else {
+            return false;
+        };
+        list.iter().any(|(_, c)| c.contains(addr))
+    }
+
+    /// Count this request toward the first matching per-path rate window and
+    /// return `true` when that prefix is over its configured req/s limit.
+    fn check_path_rate(&self, norm_path: &str, now_s: i64) -> bool {
+        for pr in &self.path_rates {
+            if norm_path.starts_with(pr.prefix.as_str()) {
+                let window = pr.window.load(Ordering::Relaxed);
+                let count = if now_s > window {
+                    pr.window.store(now_s, Ordering::Relaxed);
+                    pr.count.store(1, Ordering::Relaxed);
+                    1
+                } else {
+                    pr.count.fetch_add(1, Ordering::Relaxed) + 1
+                };
+                return count > pr.limit;
+            }
+        }
+        false
+    }
+
+    /// PoW difficulty to issue right now: the harder attack difficulty while a
+    /// mitigation window is active (when configured), else the base difficulty.
+    fn effective_pow_difficulty(&self, now_s: i64) -> usize {
+        match self.cfg.pow_difficulty_attack {
+            Some(d) if now_s < self.mitigation_until.load(Ordering::SeqCst) => d,
+            _ => self.cfg.pow_difficulty,
+        }
+    }
+
+    /// Record a backend 404 for scanner detection; blocks the client once it
+    /// exceeds `max` 404s within a 60-second window.
+    fn note_404(&self, state: &Arc<ClientState>, max: i64) {
+        let now_s = now_unix();
+        let should_block = {
+            let mut inner = state.inner.lock().unwrap();
+            if now_s - inner.not_found_window_s >= 60 {
+                inner.not_found_window_s = now_s;
+                inner.not_found_count = 0;
+            }
+            inner.not_found_count += 1;
+            if inner.not_found_count > max && !inner.blocked {
+                inner.blocked = true;
+                inner.blocked_at_ms = now_millis();
+                true
+            } else {
+                false
+            }
+        };
+        if should_block {
+            state.blocked_flag.store(true, Ordering::SeqCst);
+            if self.prom() {
+                metrics::dropped("scanner_404");
+            }
+            tracing::info!("Blocking client after excessive 404s (scanner behaviour)");
+        }
+    }
+
+    fn render_challenge(
+        &self,
+        err: &str,
+        site_key: &str,
+        original_url: &str,
+        salt: &str,
+        difficulty: usize,
+    ) -> String {
         let tmpl = self.env.get_template("challenge.html").unwrap();
         tmpl.render(context! {
             error => err,
             site_key => site_key,
             original_url => original_url,
             pow_salt => salt,
-            pow_difficulty => self.cfg.pow_difficulty,
+            pow_difficulty => difficulty,
         })
         .unwrap_or_default()
     }
 
     fn serve_challenge(&self, ip: &str, host: &str, original_url: &str, err: &str) -> Response<BoxedBody> {
+        // Adaptive PoW: issue the harder attack difficulty during mitigation.
+        // The issued difficulty is remembered per client so verification accepts
+        // exactly what the client was asked to solve.
+        let difficulty = self.effective_pow_difficulty(now_unix());
         let salt = match self.get_client_state(ip, host) {
             Some(state) => {
                 let mut inner = state.inner.lock().unwrap();
@@ -318,12 +478,19 @@ impl Manager {
                     inner.pow_salt = random_hex_16();
                 }
                 inner.challenge_served_at_ms = now_millis();
+                inner.pow_difficulty_issued = difficulty;
                 inner.pow_salt.clone()
             }
             None => random_hex_16(),
         };
 
-        let body = self.render_challenge(err, &self.cfg.turnstile_site_key, original_url, &salt);
+        let body = self.render_challenge(
+            err,
+            &self.cfg.turnstile_site_key,
+            original_url,
+            &salt,
+            difficulty,
+        );
 
         if self.prom() {
             metrics::challenged();
@@ -415,6 +582,46 @@ impl Manager {
         // alerter can report true incoming traffic rate, not just proxied requests.
         self.rl.inc_total();
 
+        // ── Global in-flight cap ─────────────────────────────────────────
+        // The guard decrements on drop, covering every return path below.
+        let _global_inflight = if let Some(max) = self.cfg.max_inflight {
+            let cur = self.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+            let guard = CounterGuard(self.inflight.clone());
+            metrics::set_inflight(cur);
+            if cur > max {
+                if self.prom() {
+                    metrics::dropped("inflight_cap");
+                }
+                return text_response(StatusCode::SERVICE_UNAVAILABLE, "Server Busy");
+            }
+            Some(guard)
+        } else {
+            None
+        };
+
+        let ip = self.get_client_ip(&req, &ctx);
+
+        // ── IP denylist (config + runtime): always blocked, first ────────
+        if self.ip_denied(&ip) {
+            if self.prom() {
+                metrics::dropped("ip_denylist");
+            }
+            if self.cfg.block_action == "close" {
+                return close_response();
+            }
+            return forbidden_response();
+        }
+
+        // ── Trusted IPs (config + runtime) bypass the WAF entirely ───────
+        // Including maintenance mode, so operators can verify the site while
+        // it is closed to the public.
+        if self.ip_trusted(&ip) {
+            if self.prom() {
+                metrics::allowed("trusted_ip");
+            }
+            return self.proxy.handle(req, &ctx).await;
+        }
+
         // ── Maintenance mode ─────────────────────────────────────────────
         if self.maintenance_mode.load(Ordering::SeqCst) {
             if self.prom() {
@@ -437,6 +644,21 @@ impl Manager {
             return text_response(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed");
         }
 
+        // ── URI length cap ───────────────────────────────────────────────
+        if let Some(max) = self.cfg.max_uri_len {
+            let uri_len = req
+                .uri()
+                .path_and_query()
+                .map(|p| p.as_str().len())
+                .unwrap_or(0);
+            if uri_len > max {
+                if self.prom() {
+                    metrics::dropped("uri_too_long");
+                }
+                return text_response(StatusCode::URI_TOO_LONG, "URI Too Long");
+            }
+        }
+
         // ── Declared body-size cap ───────────────────────────────────────
         // Checked against Content-Length only: the proxy streams bodies, so this
         // rejects declared oversized uploads cheaply before they hit the backend.
@@ -454,25 +676,55 @@ impl Manager {
             }
         }
 
-        let ip = self.get_client_ip(&req, &ctx);
+        let host = req
+            .headers()
+            .get(http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
 
-        // ── IP denylist: always blocked, before anything else ────────────
-        if crate::netmatch::ip_in_list(&ip, &self.cfg.deny_ips) {
-            if self.prom() {
-                metrics::dropped("ip_denylist");
+        // ── Host allowlist ───────────────────────────────────────────────
+        if !self.cfg.allowed_hosts.is_empty() {
+            let h = strip_port(&host).to_lowercase();
+            if !self.cfg.allowed_hosts.iter().any(|a| host_matches(a, &h)) {
+                if self.prom() {
+                    metrics::dropped("host_not_allowed");
+                }
+                return forbidden_response();
             }
-            if self.cfg.block_action == "close" {
-                return close_response();
+        }
+
+        // Normalized path (dot segments resolved, duplicate slashes collapsed)
+        // used for all path-based security matching below; the original path is
+        // forwarded upstream untouched.
+        let norm_path = normalize_path(req.uri().path());
+
+        // ── Blocked path prefixes ────────────────────────────────────────
+        if self
+            .cfg
+            .blocked_paths
+            .iter()
+            .any(|p| norm_path.starts_with(p.as_str()))
+        {
+            if self.prom() {
+                metrics::dropped("blocked_path");
             }
             return forbidden_response();
         }
 
-        // ── Trusted IPs bypass the WAF entirely ──────────────────────────
-        if crate::netmatch::ip_in_list(&ip, &self.cfg.trusted_ips) {
-            if self.prom() {
-                metrics::allowed("trusted_ip");
+        // ── Regex WAF rule (raw path + query) ────────────────────────────
+        if let Some(re) = &self.cfg.block_regex {
+            let pq = req
+                .uri()
+                .path_and_query()
+                .map(|p| p.as_str())
+                .unwrap_or("/");
+            if re.is_match(pq) {
+                if self.prom() {
+                    metrics::dropped("block_regex");
+                }
+                return forbidden_response();
             }
-            return self.proxy.handle(req, &ctx).await;
         }
 
         if is_websocket_upgrade(&req) {
@@ -485,6 +737,14 @@ impl Manager {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
+
+        // ── Require a User-Agent ─────────────────────────────────────────
+        if self.cfg.require_ua && ua.is_empty() {
+            if self.prom() {
+                metrics::dropped("no_user_agent");
+            }
+            return forbidden_response();
+        }
 
         // Blocked UA check (known-bad bots / scrapers).
         if !self.cfg.blocked_ua.is_empty() {
@@ -516,12 +776,26 @@ impl Manager {
             }
         }
 
-        let host = req
-            .headers()
-            .get(http::header::HOST)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string())
-            .unwrap_or_default();
+        // ── Site-wide Basic auth gate (staging protection) ───────────────
+        if let Some(expected) = &self.cfg.basic_auth {
+            let provided = req
+                .headers()
+                .get(http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if !ct_eq(provided.as_bytes(), expected.as_bytes()) {
+                if self.prom() {
+                    metrics::dropped("basic_auth");
+                }
+                let mut resp = text_response(StatusCode::UNAUTHORIZED, "Unauthorized");
+                resp.headers_mut().insert(
+                    http::header::WWW_AUTHENTICATE,
+                    HeaderValue::from_static("Basic realm=\"restricted\""),
+                );
+                return resp;
+            }
+        }
+
         let original_url = req
             .uri()
             .path_and_query()
@@ -540,6 +814,46 @@ impl Manager {
             }
         };
         state.last_seen.store(now_s, Ordering::SeqCst);
+
+        // ── Honeypot paths: instant block ────────────────────────────────
+        // No legitimate user requests these; anything touching them is hostile.
+        if self
+            .cfg
+            .honeypot_paths
+            .iter()
+            .any(|p| norm_path.starts_with(p.as_str()))
+        {
+            {
+                let mut inner = state.inner.lock().unwrap();
+                inner.blocked = true;
+                inner.blocked_at_ms = now_ms;
+            }
+            state.blocked_flag.store(true, Ordering::SeqCst);
+            if self.prom() {
+                metrics::dropped("honeypot");
+            }
+            tracing::info!(ip = %ip, path = %norm_path, "Honeypot path hit; blocking client");
+            if self.cfg.block_action == "close" {
+                return close_response();
+            }
+            return forbidden_response();
+        }
+
+        // ── Per-IP concurrency cap ───────────────────────────────────────
+        // The guard decrements on drop, covering every return path below.
+        let _ip_inflight = if let Some(max) = self.cfg.max_concurrent_per_ip {
+            let cur = state.inflight.fetch_add(1, Ordering::SeqCst) + 1;
+            let guard = StateInflightGuard(state.clone());
+            if cur > max {
+                if self.prom() {
+                    metrics::dropped("per_ip_concurrency");
+                }
+                return text_response(StatusCode::TOO_MANY_REQUESTS, "Too Many Concurrent Requests");
+            }
+            Some(guard)
+        } else {
+            None
+        };
 
         // ── Blocked fast-path ────────────────────────────────────────────
         if state.blocked_flag.load(Ordering::SeqCst) {
@@ -575,11 +889,12 @@ impl Manager {
         // Webhooks / machine-to-machine endpoints that can't solve challenges.
         // Placed after the blocked fast-path so blocked IPs stay blocked here,
         // but before any challenge logic so these paths are never challenged.
+        // Matched on the normalized path so `/api/../admin` can't slip through.
         if self
             .cfg
             .exempt_paths
             .iter()
-            .any(|prefix| path.starts_with(prefix.as_str()))
+            .any(|prefix| norm_path.starts_with(prefix.as_str()))
         {
             self.rl.inc_req();
             if self.prom() {
@@ -635,6 +950,18 @@ impl Manager {
                 metrics::per_ip_rate_limited();
             }
         }
+
+        // Per-path rate limit: an over-limit prefix (e.g. /login) is served the
+        // challenge without opening a global mitigation window. Folded into the
+        // same escalation path as the per-IP limit (straight to JS/PoW).
+        let path_over_limit = self.check_path_rate(&norm_path, now_s);
+        if path_over_limit {
+            tracing::debug!(path = %norm_path, "per-path rate limit exceeded; serving challenge");
+            if self.prom() {
+                metrics::path_rate_limited();
+            }
+        }
+        let per_ip_over_limit = per_ip_over_limit || path_over_limit;
 
         // Global rate-limit / mitigation evaluation.
         let (req_rate, conn_rate) = self.rl.get_counts();
@@ -756,7 +1083,7 @@ impl Manager {
             metrics::allowed("normal");
         }
 
-        if self.cfg.auto_mitigation_on_timeout {
+        let resp = if self.cfg.auto_mitigation_on_timeout {
             let start = Instant::now();
             let resp = self.proxy.handle(req, &ctx).await;
             let duration = start.elapsed();
@@ -774,7 +1101,17 @@ impl Manager {
             resp
         } else {
             self.proxy.handle(req, &ctx).await
+        };
+
+        // Scanner detection: clients racking up backend 404s are probing for
+        // exploitable files; block them once they exceed the configured budget.
+        if let Some(max) = self.cfg.max_404_per_ip {
+            if resp.status() == StatusCode::NOT_FOUND {
+                self.note_404(&state, max);
+            }
         }
+
+        resp
     }
 
     async fn verify_challenge(&self, req: Request<Incoming>, ctx: &ReqCtx) -> Response<BoxedBody> {
@@ -855,9 +1192,13 @@ impl Manager {
                 Some(s) => s,
                 None => return self.serve_challenge(&ip, &host, "", "Invalid challenge session"),
             };
-            let (salt, served_at) = {
+            let (salt, served_at, issued_difficulty) = {
                 let inner = state.inner.lock().unwrap();
-                (inner.pow_salt.clone(), inner.challenge_served_at_ms)
+                (
+                    inner.pow_salt.clone(),
+                    inner.challenge_served_at_ms,
+                    inner.pow_difficulty_issued,
+                )
             };
             if salt.is_empty() {
                 return self.serve_challenge(&ip, &host, "", "Invalid challenge session");
@@ -876,7 +1217,14 @@ impl Manager {
             let mut hasher = Sha256::new();
             hasher.update(format!("{salt}{nonce}").as_bytes());
             let hash_hex = hex::encode(hasher.finalize());
-            let target_prefix = "0".repeat(self.cfg.pow_difficulty);
+            // Verify against the difficulty this client was actually issued
+            // (adaptive difficulty may differ from the current base setting).
+            let difficulty = if issued_difficulty > 0 {
+                issued_difficulty
+            } else {
+                self.cfg.pow_difficulty
+            };
+            let target_prefix = "0".repeat(difficulty);
             if !hash_hex.starts_with(&target_prefix) {
                 if self.prom() {
                     metrics::dropped("challenge_pow_failed");
@@ -993,6 +1341,8 @@ pub struct MitigationStatus {
     pub js_challenge_until_unix: i64,
     pub ip_state_count: i64,
     pub maintenance_active: bool,
+    pub uptime_secs: i64,
+    pub version: String,
 }
 
 impl Manager {
@@ -1050,7 +1400,88 @@ impl Manager {
             js_challenge_until_unix: js_challenge_until,
             ip_state_count: self.ip_state_count.load(Ordering::SeqCst),
             maintenance_active: self.maintenance_active(),
+            uptime_secs: now_s - self.started_at_unix,
+            version: env!("CARGO_PKG_VERSION").to_string(),
         }
+    }
+
+    /// Remove every tracked client state (admin). L4 blocks held by tracked
+    /// states are released. Returns the number of states cleared.
+    pub fn clear_states(&self) -> i64 {
+        let mut l4_ips: Vec<String> = Vec::new();
+        for entry in self.ip_states.iter() {
+            let inner = entry.value().inner.lock().unwrap();
+            if inner.l4_blocked {
+                if let Some(ip) = entry.key().split('|').next() {
+                    l4_ips.push(ip.to_string());
+                }
+            }
+        }
+        self.ip_states.clear();
+        let cleared = self.ip_state_count.swap(0, Ordering::SeqCst);
+        for ip in l4_ips {
+            self.unblock_l4(&ip);
+        }
+        tracing::info!(cleared = cleared, "Admin: cleared all IP states");
+        cleared
+    }
+
+    /// Force the global mitigation window on (for `mitigation_time`) or off.
+    pub fn set_mitigation(&self, on: bool) {
+        let now_s = now_unix();
+        if on {
+            self.mitigation_started_at.store(now_s, Ordering::SeqCst);
+            self.mitigation_until.store(
+                now_s + self.cfg.mitigation_time.as_secs() as i64,
+                Ordering::SeqCst,
+            );
+        } else {
+            self.mitigation_until.store(0, Ordering::SeqCst);
+            self.js_challenge_until.store(0, Ordering::SeqCst);
+        }
+        tracing::info!(enabled = on, "Admin: mitigation window toggled");
+    }
+
+    /// List runtime deny- or trust-list entries (admin).
+    pub fn list_dyn_ips(&self, deny: bool) -> Vec<String> {
+        let list = if deny { &self.dyn_deny } else { &self.dyn_trust };
+        list.read().unwrap().iter().map(|(s, _)| s.clone()).collect()
+    }
+
+    /// Add an IP/CIDR to the runtime deny- or trust-list (admin).
+    /// Returns false when the entry is invalid; duplicates are no-ops.
+    pub fn add_dyn_ip(&self, deny: bool, entry: &str) -> bool {
+        let entry = entry.trim();
+        let Some(cidr) = IpCidr::parse(entry) else {
+            return false;
+        };
+        let list = if deny { &self.dyn_deny } else { &self.dyn_trust };
+        let mut guard = list.write().unwrap();
+        if !guard.iter().any(|(s, _)| s == entry) {
+            guard.push((entry.to_string(), cidr));
+        }
+        tracing::info!(entry = entry, deny = deny, "Admin: runtime IP list entry added");
+        true
+    }
+
+    /// Remove an entry from the runtime deny- or trust-list (admin).
+    /// Returns true when an entry was actually removed.
+    pub fn remove_dyn_ip(&self, deny: bool, entry: &str) -> bool {
+        let entry = entry.trim();
+        let list = if deny { &self.dyn_deny } else { &self.dyn_trust };
+        let mut guard = list.write().unwrap();
+        let before = guard.len();
+        guard.retain(|(s, _)| s != entry);
+        let removed = guard.len() < before;
+        if removed {
+            tracing::info!(entry = entry, deny = deny, "Admin: runtime IP list entry removed");
+        }
+        removed
+    }
+
+    /// Wipe the proxy disk cache (admin). `None` when caching is disabled.
+    pub fn purge_cache(&self) -> Option<usize> {
+        self.proxy.purge_cache()
     }
 
     /// Whether admin-toggled maintenance mode is currently on.
@@ -1116,6 +1547,17 @@ fn strip_port(addr: &str) -> String {
             host.trim_matches(|c| c == '[' || c == ']').to_string()
         }
         _ => addr.to_string(),
+    }
+}
+
+/// Match a lowercase, port-stripped host against an allowlist entry: exact
+/// match, or `*.example.com` matching any subdomain (but not the apex).
+fn host_matches(entry: &str, host: &str) -> bool {
+    if let Some(suffix) = entry.strip_prefix("*.") {
+        host.len() > suffix.len() + 1 && host.ends_with(suffix)
+            && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
+    } else {
+        entry == host
     }
 }
 
@@ -1214,7 +1656,19 @@ fn redirect_found(location: &str) -> Response<BoxedBody> {
 
 #[cfg(test)]
 mod tests {
-    use super::{safe_redirect_path, strip_port};
+    use super::{host_matches, safe_redirect_path, strip_port};
+
+    #[test]
+    fn host_matches_exact_and_wildcard() {
+        assert!(host_matches("example.com", "example.com"));
+        assert!(!host_matches("example.com", "www.example.com"));
+        assert!(host_matches("*.example.com", "www.example.com"));
+        assert!(host_matches("*.example.com", "a.b.example.com"));
+        // Wildcard does not match the apex or unrelated suffixes.
+        assert!(!host_matches("*.example.com", "example.com"));
+        assert!(!host_matches("*.example.com", "evilexample.com"));
+        assert!(!host_matches("*.example.com", "other.com"));
+    }
 
     #[test]
     fn safe_redirect_allows_local_paths() {
