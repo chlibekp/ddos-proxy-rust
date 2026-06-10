@@ -32,6 +32,15 @@ pub fn is_websocket_upgrade<B>(req: &http::Request<B>) -> bool {
     conn.to_ascii_lowercase().contains("upgrade") && upgrade.eq_ignore_ascii_case("websocket")
 }
 
+/// Random 16-byte lowercase-hex string (32 chars). Used for PoW salts,
+/// cookie-challenge tokens, and request IDs.
+pub fn random_hex_16() -> String {
+    use rand::RngCore;
+    let mut b = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut b);
+    hex::encode(b)
+}
+
 /// Constant-time byte-slice equality. Returns false fast on length mismatch
 /// (lengths are not secret), otherwise compares every byte.
 pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {

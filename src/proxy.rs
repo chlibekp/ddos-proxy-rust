@@ -205,46 +205,12 @@ impl Proxy {
         result
     }
 
-    /// Main proxy entry point. Handles `X-Request-Id` generation/propagation
-    /// (inserted into the inbound headers so it is forwarded upstream, and set
-    /// on whatever response is produced), then delegates to `handle_inner`.
-    pub async fn handle(&self, mut req: Request<Incoming>, ctx: &ReqCtx) -> Response<BoxedBody> {
-        let req_id = if self.cfg.request_id {
-            let inbound = req
-                .headers()
-                .get("x-request-id")
-                .and_then(|v| v.to_str().ok())
-                .filter(|s| {
-                    !s.is_empty()
-                        && s.len() <= 128
-                        && s.bytes()
-                            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
-                })
-                .map(|s| s.to_string());
-            let id = inbound.unwrap_or_else(random_request_id);
-            if let Ok(hv) = HeaderValue::from_str(&id) {
-                req.headers_mut()
-                    .insert(HeaderName::from_static("x-request-id"), hv);
-            }
-            Some(id)
-        } else {
-            None
-        };
-
-        let mut resp = self.handle_inner(req, ctx).await;
-
-        if let Some(id) = req_id {
-            if let Ok(hv) = HeaderValue::from_str(&id) {
-                resp.headers_mut()
-                    .insert(HeaderName::from_static("x-request-id"), hv);
-            }
-        }
-        resp
-    }
-
-    /// Forwards `req` to the backend, applying the same header manipulation,
-    /// JS injection and caching behaviour as the Go proxy.
-    async fn handle_inner(&self, req: Request<Incoming>, ctx: &ReqCtx) -> Response<BoxedBody> {
+    /// Main proxy entry point. Forwards `req` to the backend, applying the same
+    /// header manipulation, JS injection and caching behaviour as the Go proxy.
+    /// (`X-Request-Id` handling lives in `route()` so WAF-generated responses
+    /// carry the ID too; the header arrives here already set on the request and
+    /// is forwarded upstream like any other.)
+    pub async fn handle(&self, req: Request<Incoming>, ctx: &ReqCtx) -> Response<BoxedBody> {
         if is_websocket_upgrade(&req) {
             return self.handle_websocket(req, ctx).await;
         }
@@ -1046,14 +1012,6 @@ fn compressible_content_type(ct: &str) -> bool {
         || ct.starts_with("application/javascript")
         || ct.starts_with("application/xml")
         || ct.starts_with("image/svg")
-}
-
-/// Random 16-byte hex request ID.
-fn random_request_id() -> String {
-    use rand::RngCore;
-    let mut b = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut b);
-    hex::encode(b)
 }
 
 pub fn normalize_cache_control(value: &str) -> String {

@@ -12,7 +12,6 @@ use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
 use minijinja::{context, Environment};
-use rand::RngCore;
 use sha2::{Digest, Sha256};
 
 use crate::body::{empty, full, BoxedBody};
@@ -22,7 +21,7 @@ use crate::limiter::RateLimiter;
 use crate::metrics;
 use crate::netmatch::IpCidr;
 use crate::proxy::{Proxy, ReqCtx};
-use crate::util::{ct_eq, is_websocket_upgrade, normalize_path, now_millis, now_unix};
+use crate::util::{ct_eq, is_websocket_upgrade, normalize_path, now_millis, now_unix, random_hex_16};
 use crate::xdp::Blocker;
 
 pub struct Manager {
@@ -1584,12 +1583,6 @@ fn safe_redirect_path(url: &str) -> String {
     } else {
         "/".to_string()
     }
-}
-
-fn random_hex_16() -> String {
-    let mut b = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut b);
-    hex::encode(b)
 }
 
 fn text_response(status: StatusCode, msg: &str) -> Response<BoxedBody> {

@@ -115,7 +115,7 @@ The proxy is configured via environment variables.
 | `PROXY_CB_THRESHOLD` | `0` (off) | Consecutive backend transport failures that trip the circuit breaker (instant `503` instead of waiting on a dead backend). |
 | `PROXY_CB_COOLDOWN` | `30s` | How long the circuit stays open after tripping. |
 | `PROXY_SERVE_STALE` | `false` | If `true` (with `PROXY_CACHE_ENABLED`), an expired cached copy is served when the backend errors, times out, returns 5xx, or the circuit is open. Marked `X-Ddos-Proxy-Cache: STALE`. |
-| `PROXY_REQUEST_ID` | `false` | If `true`, an `X-Request-Id` is generated (or a valid inbound one kept), forwarded to the backend and returned on the response. |
+| `PROXY_REQUEST_ID` | `false` | If `true`, an `X-Request-Id` is generated (or a valid inbound one kept), forwarded to the backend, and stamped on **every** response to the client — proxied, challenged, blocked, maintenance, and admin alike. Also included in access-log lines when `PROXY_ACCESS_LOG` is on. |
 | `PROXY_ADD_HEADERS` | `""` | Custom response headers, `Name=Value;Name2=Value2`. Overwrite backend values. |
 | `PROXY_REMOVE_HEADERS` | `""` | Comma-separated response headers to strip (e.g. `X-Powered-By`). |
 | `PROXY_CORS_ORIGIN` | `""` (off) | Adds `Access-Control-Allow-Origin` (plus `-Methods`/`-Headers`) to responses unless the backend set them. |

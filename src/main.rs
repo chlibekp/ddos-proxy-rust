@@ -217,42 +217,88 @@ async fn serve_plain(
 /// Route a request: `/metrics`, `/healthz`, and `/admin/` bypass the WAF;
 /// everything else goes through the WAF middleware. When `PROXY_ACCESS_LOG`
 /// is enabled, every request (including bypass routes) is logged with its
-/// outcome and duration.
+/// outcome and duration. When `PROXY_REQUEST_ID` is enabled, an `X-Request-Id`
+/// is set on the inbound request (so the proxy forwards it to the backend) and
+/// stamped on **every** outgoing response — proxied, challenged, blocked,
+/// maintenance, admin, metrics — so any response a client reports can be
+/// correlated with logs.
 pub async fn route(
-    req: Request<Incoming>,
+    mut req: Request<Incoming>,
     ctx: ReqCtx,
     manager: Arc<Manager>,
     ip_limiter: Option<Arc<IPLimiter>>,
 ) -> Result<Response<BoxedBody>, Infallible> {
-    if !manager.config().access_log {
-        return Ok(dispatch(req, ctx, manager, ip_limiter).await);
+    let (want_request_id, access_log) = {
+        let cfg = manager.config();
+        (cfg.request_id, cfg.access_log)
+    };
+
+    let req_id = if want_request_id {
+        Some(ensure_request_id(&mut req))
+    } else {
+        None
+    };
+
+    let mut resp = if access_log {
+        let start = std::time::Instant::now();
+        let method = req.method().to_string();
+        let path = req
+            .uri()
+            .path_and_query()
+            .map(|p| p.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string());
+        let ip = ctx
+            .remote_addr
+            .rsplit_once(':')
+            .map(|(h, _)| h.trim_matches(|c| c == '[' || c == ']').to_string())
+            .unwrap_or_else(|| ctx.remote_addr.clone());
+
+        let resp = dispatch(req, ctx, manager, ip_limiter).await;
+
+        tracing::info!(
+            target: "access",
+            method = %method,
+            path = %path,
+            status = resp.status().as_u16(),
+            duration_ms = start.elapsed().as_millis() as u64,
+            ip = %ip,
+            request_id = req_id.as_deref().unwrap_or(""),
+            "request",
+        );
+        resp
+    } else {
+        dispatch(req, ctx, manager, ip_limiter).await
+    };
+
+    if let Some(id) = req_id {
+        if let Ok(hv) = http::HeaderValue::from_str(&id) {
+            resp.headers_mut()
+                .insert(http::header::HeaderName::from_static("x-request-id"), hv);
+        }
     }
-
-    let start = std::time::Instant::now();
-    let method = req.method().to_string();
-    let path = req
-        .uri()
-        .path_and_query()
-        .map(|p| p.as_str().to_string())
-        .unwrap_or_else(|| "/".to_string());
-    let ip = ctx
-        .remote_addr
-        .rsplit_once(':')
-        .map(|(h, _)| h.trim_matches(|c| c == '[' || c == ']').to_string())
-        .unwrap_or_else(|| ctx.remote_addr.clone());
-
-    let resp = dispatch(req, ctx, manager, ip_limiter).await;
-
-    tracing::info!(
-        target: "access",
-        method = %method,
-        path = %path,
-        status = resp.status().as_u16(),
-        duration_ms = start.elapsed().as_millis() as u64,
-        ip = %ip,
-        "request",
-    );
     Ok(resp)
+}
+
+/// Keep a sane inbound `X-Request-Id` (alphanumeric/`-`/`_`/`.`, ≤ 128 chars)
+/// or mint a fresh one, set it on the request headers, and return it.
+fn ensure_request_id(req: &mut Request<Incoming>) -> String {
+    let inbound = req
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| {
+            !s.is_empty()
+                && s.len() <= 128
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+        })
+        .map(|s| s.to_string());
+    let id = inbound.unwrap_or_else(util::random_hex_16);
+    if let Ok(hv) = http::HeaderValue::from_str(&id) {
+        req.headers_mut()
+            .insert(http::header::HeaderName::from_static("x-request-id"), hv);
+    }
+    id
 }
 
 async fn dispatch(
