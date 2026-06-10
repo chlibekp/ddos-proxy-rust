@@ -42,6 +42,13 @@ use crate::waf::Manager;
 const RENEW_BEFORE_SECS: i64 = 24 * 3600;
 const RETRY_BACKOFF_SECS: i64 = 60;
 
+// Global rate limit on starting new certificate issuances. Certs are issued
+// on demand for any SNI, so this caps how many distinct new domains can trigger
+// an ACME order within a rolling window — bounding load on the CA (and staying
+// well under Let's Encrypt's account rate limits) under a distinct-SNI flood.
+const ISSUE_RATE_MAX: u32 = 10;
+const ISSUE_RATE_WINDOW_SECS: i64 = 60;
+
 type Challenges = Arc<DashMap<String, String>>; // token -> key authorization
 
 struct CachedCert {
@@ -54,6 +61,8 @@ struct ResolverInner {
     certs: DashMap<String, Arc<CachedCert>>,
     inflight: DashMap<String, ()>,
     backoff: DashMap<String, i64>, // host -> earliest next attempt (unix secs)
+    // Rolling-window counter of issuances started: (window_start_unix, count).
+    issue_rate: std::sync::Mutex<(i64, u32)>,
     challenges: Challenges,
     account: Arc<OnceCell<Arc<Account>>>,
     cert_dir: PathBuf,
@@ -111,6 +120,25 @@ impl ResolverInner {
         if self.inflight.contains_key(&host) {
             return;
         }
+
+        // Global issuance rate limit (rolling window). Protects the CA from a
+        // flood of distinct SNIs each spawning an ACME order.
+        {
+            let mut guard = self.issue_rate.lock().unwrap();
+            let (window_start, count) = *guard;
+            if now - window_start >= ISSUE_RATE_WINDOW_SECS {
+                *guard = (now, 1);
+            } else if count >= ISSUE_RATE_MAX {
+                tracing::warn!(
+                    server_name = %host,
+                    "ACME issuance rate limit reached; deferring certificate request"
+                );
+                return;
+            } else {
+                guard.1 = count + 1;
+            }
+        }
+
         self.inflight.insert(host.clone(), ());
 
         let this = self.clone();
@@ -128,41 +156,6 @@ impl ResolverInner {
             }
             this.inflight.remove(&host);
         });
-    }
-
-    /// Host policy: only issue if the backend answers 200 on `/` for this host.
-    /// Set `PROXY_ACME_SKIP_HOST_POLICY=true` to bypass the probe entirely.
-    async fn host_policy_ok(&self, host: &str) -> bool {
-        if self.cfg.acme_skip_host_policy {
-            tracing::info!(host = host, "ACME host policy skipped (PROXY_ACME_SKIP_HOST_POLICY)");
-            return true;
-        }
-        let url = format!("{}/", self.cfg.backend_url.trim_end_matches('/'));
-        let client = match reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-        {
-            Ok(c) => c,
-            Err(_) => return false,
-        };
-        match client.get(&url).header(http::header::HOST, host).send().await {
-            Ok(resp) => {
-                let ok = resp.status() == StatusCode::OK;
-                if ok {
-                    tracing::info!(host = host, backend = %self.cfg.backend_url, "ACME host policy approved host");
-                } else {
-                    tracing::error!(host = host, status_code = resp.status().as_u16(), "ACME host policy rejected host");
-                }
-                ok
-            }
-            Err(e) => {
-                // Connection failure (backend temporarily unreachable) is not evidence
-                // that the host is illegitimate — fail open so a backend restart doesn't
-                // permanently block cert issuance for valid hosts.
-                tracing::warn!(host = host, error = %e, "ACME host policy backend probe failed; allowing issuance");
-                true
-            }
-        }
     }
 
     async fn get_account(&self) -> Result<Arc<Account>, String> {
@@ -205,10 +198,6 @@ impl ResolverInner {
 
     async fn issue(&self, host: &str) -> Result<CachedCert, String> {
         tracing::info!(server_name = host, "TLS certificate request received");
-
-        if !self.host_policy_ok(host).await {
-            return Err("host policy rejected".to_string());
-        }
 
         let account = self.get_account().await?;
 
@@ -416,6 +405,7 @@ pub async fn serve_tls(
         certs: DashMap::new(),
         inflight: DashMap::new(),
         backoff: DashMap::new(),
+        issue_rate: std::sync::Mutex::new((0, 0)),
         challenges: challenges.clone(),
         account: Arc::new(OnceCell::new()),
         cert_dir,

@@ -34,9 +34,6 @@ pub struct Config {
     pub acme_email: String,
     pub acme_eab_key_id: String,
     pub acme_eab_hmac: String,
-    /// When true, skip the backend probe and always allow cert issuance.
-    /// Set via `PROXY_ACME_SKIP_HOST_POLICY=true`.
-    pub acme_skip_host_policy: bool,
     pub xdp_interface: String,
     pub pow_difficulty: usize,
     pub max_ip_states: i64,
@@ -294,7 +291,6 @@ impl Config {
             .trim()
             .to_string();
 
-        let acme_skip_host_policy = parse_bool("PROXY_ACME_SKIP_HOST_POLICY");
 
         let pow_difficulty = env_nonempty("PROXY_POW_DIFFICULTY")
             .and_then(|s| s.parse::<i64>().ok())
@@ -519,7 +515,6 @@ impl Config {
             acme_email,
             acme_eab_key_id,
             acme_eab_hmac,
-            acme_skip_host_policy,
             xdp_interface,
             pow_difficulty,
             max_ip_states,
