@@ -135,6 +135,9 @@ impl Manager {
         if self.cfg.max_ip_states > 0
             && self.ip_state_count.load(Ordering::SeqCst) >= self.cfg.max_ip_states
         {
+            if self.prom() {
+                metrics::ip_states_cap_hit();
+            }
             return None;
         }
 
@@ -182,6 +185,9 @@ impl Manager {
         let mut to_unblock: Vec<String> = Vec::new();
         // Count challenges that were issued but never solved before eviction.
         let mut abandoned: u64 = 0;
+        // Eviction reason counters for Prometheus.
+        let mut evicted_mitigation_ended: u64 = 0;
+        let mut evicted_idle: u64 = 0;
 
         for entry in self.ip_states.iter() {
             let key = entry.key().clone();
@@ -198,6 +204,7 @@ impl Manager {
                 if inner.challenge_served {
                     abandoned += 1;
                 }
+                evicted_mitigation_ended += 1;
                 to_delete.push(key);
                 continue;
             }
@@ -222,6 +229,7 @@ impl Manager {
                 if inner.challenge_served {
                     abandoned += 1;
                 }
+                evicted_idle += 1;
                 to_delete.push(key.clone());
             }
         }
@@ -239,6 +247,12 @@ impl Manager {
             metrics::set_ip_states(self.ip_state_count.load(Ordering::SeqCst));
             if abandoned > 0 {
                 metrics::challenge_abandoned(abandoned);
+            }
+            if evicted_mitigation_ended > 0 {
+                metrics::ip_states_evicted("mitigation_ended", evicted_mitigation_ended);
+            }
+            if evicted_idle > 0 {
+                metrics::ip_states_evicted("idle", evicted_idle);
             }
         }
     }

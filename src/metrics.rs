@@ -219,6 +219,38 @@ pub static IP_STATES: Lazy<IntGauge> = Lazy::new(|| {
     g
 });
 
+/// Per-IP client states removed from the tracking map, broken down by eviction reason.
+///
+/// `idle`             — state evicted because the IP was inactive for 10 minutes.
+/// `mitigation_ended` — state evicted because the mitigation window closed and the
+///                      IP had not been verified (unverified bots cleared en-masse).
+pub static IP_STATES_EVICTED: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "ddos_proxy_ip_states_evicted_total",
+            "Total per-IP client states evicted from the tracking map, by reason",
+        ),
+        &["reason"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).unwrap();
+    c
+});
+
+/// Requests for which no per-IP state could be allocated because the
+/// `PROXY_MAX_IP_STATES` cap was already full. Incremented on every request
+/// that finds the map at capacity. A sustained non-zero rate here means the cap
+/// should be raised or the attack volume is generating too many unique IPs.
+pub static IP_STATES_CAP_HITS: Lazy<IntCounter> = Lazy::new(|| {
+    let c = IntCounter::new(
+        "ddos_proxy_ip_states_cap_hits_total",
+        "Requests served without state tracking because PROXY_MAX_IP_STATES was full",
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).unwrap();
+    c
+});
+
 /// Initialise counters to 0 so they appear in metrics output immediately,
 /// matching the Go `init()` behaviour.
 pub fn init() {
@@ -258,6 +290,11 @@ pub fn init() {
     // Force Lazy initialisation so histograms, vecs, and gauge appear on the first scrape.
     let _ = &*BACKEND_REQUEST_DURATION;
     let _ = &*IP_STATES;
+    IP_STATES_EVICTED.with_label_values(&["idle"]).inc_by(0);
+    IP_STATES_EVICTED
+        .with_label_values(&["mitigation_ended"])
+        .inc_by(0);
+    let _ = &*IP_STATES_CAP_HITS;
     let _ = &*PER_IP_RATE_LIMITED;
     let _ = &*VERIFY_RATE_LIMITED;
     let _ = &*CHALLENGE_ABANDONED;
@@ -292,6 +329,16 @@ pub fn backend_duration(secs: f64) {
 
 pub fn set_ip_states(count: i64) {
     IP_STATES.set(count);
+}
+
+/// Record `count` states evicted for the given reason (`"idle"` or `"mitigation_ended"`).
+pub fn ip_states_evicted(reason: &str, count: u64) {
+    IP_STATES_EVICTED.with_label_values(&[reason]).inc_by(count);
+}
+
+/// Record one request that could not be assigned a tracking state because the cap was full.
+pub fn ip_states_cap_hit() {
+    IP_STATES_CAP_HITS.inc();
 }
 
 /// Record a successfully solved challenge.
@@ -459,5 +506,39 @@ mod tests {
             .get_sample_count();
         // recording a "turnstile" observation must not affect the "pow" series
         assert_eq!(pow_before, pow_after);
+    }
+
+    #[test]
+    fn ip_states_evicted_increments_by_reason() {
+        let idle_before = IP_STATES_EVICTED.with_label_values(&["idle"]).get();
+        let mit_before = IP_STATES_EVICTED
+            .with_label_values(&["mitigation_ended"])
+            .get();
+
+        ip_states_evicted("idle", 5);
+        ip_states_evicted("mitigation_ended", 3);
+
+        assert_eq!(IP_STATES_EVICTED.with_label_values(&["idle"]).get(), idle_before + 5);
+        assert_eq!(
+            IP_STATES_EVICTED.with_label_values(&["mitigation_ended"]).get(),
+            mit_before + 3
+        );
+    }
+
+    #[test]
+    fn ip_states_evicted_reasons_are_independent() {
+        let idle_before = IP_STATES_EVICTED.with_label_values(&["idle"]).get();
+        ip_states_evicted("mitigation_ended", 10);
+        // idle counter must not be affected by a mitigation_ended increment
+        assert_eq!(IP_STATES_EVICTED.with_label_values(&["idle"]).get(), idle_before);
+    }
+
+    #[test]
+    fn ip_states_cap_hits_increments() {
+        let before = IP_STATES_CAP_HITS.get();
+        ip_states_cap_hit();
+        ip_states_cap_hit();
+        ip_states_cap_hit();
+        assert_eq!(IP_STATES_CAP_HITS.get(), before + 3);
     }
 }
