@@ -34,9 +34,6 @@ pub struct Config {
     pub acme_email: String,
     pub acme_eab_key_id: String,
     pub acme_eab_hmac: String,
-    /// When true, skip the backend probe and always allow cert issuance.
-    /// Set via `PROXY_ACME_SKIP_HOST_POLICY=true`.
-    pub acme_skip_host_policy: bool,
     pub xdp_interface: String,
     pub pow_difficulty: usize,
     pub max_ip_states: i64,
@@ -217,7 +214,16 @@ impl Config {
     pub fn load() -> Result<Config, MissingBackendURL> {
         let backend_url = env_nonempty("PROXY_BACKEND_URL").ok_or(MissingBackendURL)?;
 
-        let port = env_nonempty("PORT").unwrap_or_else(|| "8080".to_string());
+        // SSL mode listens for HTTPS, so when PORT is left unset default it to
+        // 443 (the port browsers use) instead of the plain-HTTP default of 8080.
+        let enable_ssl = parse_bool("PROXY_ENABLE_SSL");
+        let port = env_nonempty("PORT").unwrap_or_else(|| {
+            if enable_ssl {
+                "443".to_string()
+            } else {
+                "8080".to_string()
+            }
+        });
         let http_port = env_nonempty("PROXY_HTTP_PORT").unwrap_or_else(|| "80".to_string());
 
         let max_req = env_nonempty("PROXY_MAX_REQ")
@@ -267,7 +273,6 @@ impl Config {
             parse_duration_env("PROXY_TIMEOUT_THRESHOLD", Duration::from_secs(5));
 
         let cache_enabled = parse_bool("PROXY_CACHE_ENABLED");
-        let enable_ssl = parse_bool("PROXY_ENABLE_SSL");
         let acme_staging = parse_bool("PROXY_ACME_STAGING");
         let acme_directory_url = env::var("PROXY_ACME_DIRECTORY_URL")
             .unwrap_or_default()
@@ -286,7 +291,6 @@ impl Config {
             .trim()
             .to_string();
 
-        let acme_skip_host_policy = parse_bool("PROXY_ACME_SKIP_HOST_POLICY");
 
         let pow_difficulty = env_nonempty("PROXY_POW_DIFFICULTY")
             .and_then(|s| s.parse::<i64>().ok())
@@ -511,7 +515,6 @@ impl Config {
             acme_email,
             acme_eab_key_id,
             acme_eab_hmac,
-            acme_skip_host_policy,
             xdp_interface,
             pow_difficulty,
             max_ip_states,

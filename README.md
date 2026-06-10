@@ -59,7 +59,7 @@ The proxy is configured via environment variables.
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `PROXY_BACKEND_URL` | **Required** | The full URL of the backend service (e.g. `http://localhost:3000`). |
-| `PORT` | `8080` | The port the proxy listens on. |
+| `PORT` | `8080` (or `443` when `PROXY_ENABLE_SSL=true`) | The port the proxy listens on. |
 | `PROXY_MAX_REQ` | `300` | Max global requests per second before triggering mitigation. |
 | `PROXY_MAX_CONN` | `50` | Max global new connections per second before triggering mitigation. |
 | `PROXY_MAX_REQ_PER_IP` | `0` (off) | Max requests per second from a single IP before that IP is served the WAF challenge. Unlike `PROXY_MAX_REQ`, exceeding this limit only challenges the offending IP and does not trigger a global mitigation window for all clients. Blocked and verified IPs are exempt. Set to `0` or omit to disable. |
@@ -87,7 +87,6 @@ The proxy is configured via environment variables.
 | `PROXY_ACME_EMAIL` | `""` | ACME contact email used during account registration. |
 | `PROXY_ACME_EAB_KEY_ID` | `""` | External Account Binding key ID (used with `PROXY_ACME_EAB_HMAC`). |
 | `PROXY_ACME_EAB_HMAC` | `""` | External Account Binding HMAC key (base64 or base64url). |
-| `PROXY_ACME_SKIP_HOST_POLICY` | `false` | If `true`, skips the backend probe that validates a hostname before issuing a cert. Useful when the backend is not directly reachable from the proxy (e.g. nginx→proxy→nginx chains) or when the probe URL differs from the public hostname. When `false` (default), a non-200 response blocks issuance; a connection error is treated as a transient failure and allows issuance. |
 | `PROXY_HTTP_PORT` | `80` | Port for the HTTP→HTTPS redirect server and ACME HTTP-01 challenges (SSL only). |
 | `PROXY_XDP_INTERFACE` | `""` | Network interface to attach the XDP program to (e.g. `eth0`). Requires the `xdp` build feature plus `NET_ADMIN`, `SYS_ADMIN`, `BPF` capabilities. |
 | `PROXY_XDP_ALERT_PPS` | `1000` | Dropped-packets-per-second threshold (measured at the XDP/L4 layer) above which a Discord **L4-flood** alert fires. `0` or less disables L4 alerting. Only active when both `PROXY_XDP_INTERFACE` and `PROXY_DISCORD_WEBHOOK_URL` are set. |
