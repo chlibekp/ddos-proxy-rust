@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use http::header::{HeaderName, HeaderValue};
 use http::{Request, Response, StatusCode};
-use http_body_util::BodyExt;
+use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
 use minijinja::{context, Environment};
 use rand::RngCore;
@@ -37,7 +37,17 @@ pub struct Manager {
     timeout_count: AtomicI64,
     ip_states: DashMap<String, Arc<ClientState>>,
     ip_state_count: AtomicI64,
+    /// Shared HTTP client for Turnstile siteverify calls. Built once and reused so
+    /// every challenge verification doesn't spin up a fresh connection pool, and a
+    /// bounded timeout keeps a slow/hung Turnstile endpoint from pinning request
+    /// handler tasks open under load.
+    http_client: reqwest::Client,
 }
+
+/// Maximum accepted body size for the `POST /challenge/verify` form. The form
+/// carries only a nonce/token plus a short URL, so anything larger is abuse;
+/// capping it stops an attacker from forcing the proxy to buffer huge bodies.
+const MAX_VERIFY_BODY: usize = 64 * 1024;
 
 impl Manager {
     pub fn new(
@@ -65,6 +75,10 @@ impl Manager {
             timeout_count: AtomicI64::new(0),
             ip_states: DashMap::new(),
             ip_state_count: AtomicI64::new(0),
+            http_client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap_or_default(),
         });
 
         // Cleanup ticker (10s cadence), mirroring Go.
@@ -378,8 +392,8 @@ impl Manager {
         if let Ok(hv) = HeaderValue::from_str(&cookie) {
             h.insert(http::header::SET_COOKIE, hv);
         }
-        let loc = if original_url.is_empty() { "/" } else { original_url };
-        if let Ok(hv) = HeaderValue::from_str(loc) {
+        let loc = safe_redirect_path(original_url);
+        if let Ok(hv) = HeaderValue::from_str(&loc) {
             h.insert(http::header::LOCATION, hv);
         }
         h.insert(HeaderName::from_static("x-mitigation"), HeaderValue::from_static("cookie"));
@@ -709,8 +723,9 @@ impl Manager {
             }
         }
 
-        // Read and parse form body.
-        let body_bytes = match req.into_body().collect().await {
+        // Read and parse form body, capping the size so a malicious client can't
+        // make us buffer an arbitrarily large body.
+        let body_bytes = match Limited::new(req.into_body(), MAX_VERIFY_BODY).collect().await {
             Ok(c) => c.to_bytes(),
             Err(_) => {
                 if self.prom() {
@@ -813,14 +828,12 @@ impl Manager {
             }
         }
 
-        let original_url = {
-            let u = get("original_url").unwrap_or_default();
-            if u.is_empty() {
-                "/".to_string()
-            } else {
-                u
-            }
-        };
+        // `original_url` is attacker-controlled here (it's just a hidden form
+        // field, and the endpoint can be POSTed to directly), so it must be
+        // validated to a same-origin path before being used as a redirect target.
+        // Otherwise it's an open redirect: solve the challenge, get bounced to
+        // any external site.
+        let original_url = safe_redirect_path(&get("original_url").unwrap_or_default());
 
         if self.prom() {
             metrics::allowed("challenge_solved");
@@ -835,8 +848,8 @@ impl Manager {
             ("response", token),
             ("remoteip", remote_ip),
         ];
-        let client = reqwest::Client::new();
-        let resp = match client
+        let resp = match self
+            .http_client
             .post("https://challenges.cloudflare.com/turnstile/v0/siteverify")
             .form(&params)
             .send()
@@ -1006,6 +1019,25 @@ fn parse_form(body: &[u8]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// Validate a redirect target so it can only point back at this origin.
+///
+/// Returns the URL unchanged when it is a safe same-origin absolute path, else
+/// falls back to `/`. This blocks open redirects: a value must start with a
+/// single `/` and must not be a scheme-relative (`//host`) or backslash-tricked
+/// (`/\host`) URL, and must not contain control characters that could smuggle
+/// extra header content.
+fn safe_redirect_path(url: &str) -> String {
+    let ok = url.starts_with('/')
+        && !url.starts_with("//")
+        && !url.starts_with("/\\")
+        && !url.bytes().any(|b| b < 0x20 || b == 0x7f);
+    if ok {
+        url.to_string()
+    } else {
+        "/".to_string()
+    }
+}
+
 fn random_hex_16() -> String {
     let mut b = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut b);
@@ -1044,4 +1076,43 @@ fn redirect_found(location: &str) -> Response<BoxedBody> {
         resp.headers_mut().insert(http::header::LOCATION, hv);
     }
     resp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{safe_redirect_path, strip_port};
+
+    #[test]
+    fn safe_redirect_allows_local_paths() {
+        assert_eq!(safe_redirect_path("/"), "/");
+        assert_eq!(safe_redirect_path("/dashboard"), "/dashboard");
+        assert_eq!(safe_redirect_path("/a/b?c=d&e=f"), "/a/b?c=d&e=f");
+    }
+
+    #[test]
+    fn safe_redirect_blocks_open_redirects() {
+        // Scheme-relative and absolute URLs must collapse to "/".
+        assert_eq!(safe_redirect_path("//evil.com"), "/");
+        assert_eq!(safe_redirect_path("https://evil.com"), "/");
+        assert_eq!(safe_redirect_path("http://evil.com/path"), "/");
+        // Backslash trick some browsers normalise to "//".
+        assert_eq!(safe_redirect_path("/\\evil.com"), "/");
+        // Empty / non-rooted values.
+        assert_eq!(safe_redirect_path(""), "/");
+        assert_eq!(safe_redirect_path("evil.com"), "/");
+    }
+
+    #[test]
+    fn safe_redirect_blocks_control_chars() {
+        // CR/LF (header smuggling) and other control bytes are rejected.
+        assert_eq!(safe_redirect_path("/foo\r\nSet-Cookie: x=1"), "/");
+        assert_eq!(safe_redirect_path("/foo\nbar"), "/");
+    }
+
+    #[test]
+    fn strip_port_handles_plain_and_bracketed() {
+        assert_eq!(strip_port("1.2.3.4:8080"), "1.2.3.4");
+        assert_eq!(strip_port("example.com"), "example.com");
+        assert_eq!(strip_port("[::1]:443"), "::1");
+    }
 }

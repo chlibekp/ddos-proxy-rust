@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use http::{Request, Response, StatusCode};
-use http_body_util::BodyExt;
+use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
 
 use crate::body::{full, BoxedBody};
@@ -52,7 +52,9 @@ pub async fn handle(req: Request<Incoming>, ctx: ReqCtx, manager: Arc<Manager>) 
         .get(http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if provided != format!("Bearer {secret}") {
+    // Constant-time comparison so the bearer token can't be recovered byte-by-byte
+    // via a timing side channel on the comparison.
+    if !ct_eq(provided.as_bytes(), format!("Bearer {secret}").as_bytes()) {
         return manager.handle(req, ctx).await;
     }
 
@@ -131,12 +133,30 @@ struct BlockReq {
 }
 
 async fn read_block_req(req: Request<Incoming>) -> Option<(String, String)> {
-    let bytes = req.into_body().collect().await.ok()?.to_bytes();
+    // Cap the body: the JSON payload is tiny, so anything larger is abuse.
+    let bytes = Limited::new(req.into_body(), 64 * 1024)
+        .collect()
+        .await
+        .ok()?
+        .to_bytes();
     let b: BlockReq = serde_json::from_slice(&bytes).ok()?;
     if b.ip.is_empty() || b.host.is_empty() {
         return None;
     }
     Some((b.ip, b.host))
+}
+
+/// Constant-time byte-slice equality. Returns false fast on length mismatch
+/// (the token length is not secret), otherwise compares every byte.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Minimal percent-decoding for the path segment after `/admin/states/`.
@@ -549,5 +569,14 @@ mod tests {
     fn percent_decode_identity() {
         let s = percent_decode("1.2.3.4|example.com");
         assert!(!s.is_empty());
+    }
+
+    #[test]
+    fn ct_eq_matches_string_equality() {
+        assert!(ct_eq(b"Bearer secret", b"Bearer secret"));
+        assert!(!ct_eq(b"Bearer secret", b"Bearer secreT"));
+        assert!(!ct_eq(b"Bearer secret", b"Bearer secret-longer"));
+        assert!(!ct_eq(b"", b"x"));
+        assert!(ct_eq(b"", b""));
     }
 }
