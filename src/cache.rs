@@ -57,8 +57,6 @@ impl DiskCache {
         }
         let meta: Meta = serde_json::from_slice(&data[8..end]).ok()?;
         if unix_now() >= meta.expires_at {
-            // Stale — drop it.
-            let _ = std::fs::remove_file(&path);
             return None;
         }
         let body = Bytes::copy_from_slice(&data[end..]);

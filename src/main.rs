@@ -1,37 +1,18 @@
-// Needed by the large serde_json::json! literal in admin::config_json.
-#![recursion_limit = "256"]
-
-mod admin;
-mod body;
-mod cache;
-mod config;
-mod discord;
-mod health;
-mod limiter;
-mod metrics;
-mod netmatch;
-mod proxy;
-mod tls;
-mod util;
-mod waf;
-mod xdp;
-
-use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
-use http::{Request, Response, StatusCode};
+use http::Request;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use tokio::net::TcpListener;
 
-use crate::body::{full, BoxedBody};
-use crate::config::Config;
-use crate::limiter::{IPLimiter, RateLimiter};
-use crate::proxy::{Proxy, ReqCtx};
-use crate::waf::Manager;
+use ddos_proxy::config::Config;
+use ddos_proxy::limiter::{IPLimiter, RateLimiter};
+use ddos_proxy::proxy::{Proxy, ReqCtx};
+use ddos_proxy::waf::Manager;
+use ddos_proxy::{discord, metrics, route, signal_future, tls, xdp};
 
 #[tokio::main]
 async fn main() {
@@ -98,9 +79,6 @@ async fn main() {
                     Some(blocker)
                 }
                 Err(e) => {
-                    // Non-fatal (unlike the Go version, which exits): the proxy
-                    // is fully functional without L4 acceleration, so a failed
-                    // XDP attach must not take the service down.
                     tracing::error!(error = %e, "Failed to initialize XDP; continuing without L4 blocking");
                     None
                 }
@@ -214,111 +192,6 @@ async fn serve_plain(
     tracing::info!("Server exited properly");
 }
 
-/// Route a request: `/metrics`, `/healthz`, and `/admin/` bypass the WAF;
-/// everything else goes through the WAF middleware. When `PROXY_ACCESS_LOG`
-/// is enabled, every request (including bypass routes) is logged with its
-/// outcome and duration.
-pub async fn route(
-    req: Request<Incoming>,
-    ctx: ReqCtx,
-    manager: Arc<Manager>,
-    ip_limiter: Option<Arc<IPLimiter>>,
-) -> Result<Response<BoxedBody>, Infallible> {
-    if !manager.config().access_log {
-        return Ok(dispatch(req, ctx, manager, ip_limiter).await);
-    }
-
-    let start = std::time::Instant::now();
-    let method = req.method().to_string();
-    let path = req
-        .uri()
-        .path_and_query()
-        .map(|p| p.as_str().to_string())
-        .unwrap_or_else(|| "/".to_string());
-    let ip = ctx
-        .remote_addr
-        .rsplit_once(':')
-        .map(|(h, _)| h.trim_matches(|c| c == '[' || c == ']').to_string())
-        .unwrap_or_else(|| ctx.remote_addr.clone());
-
-    let resp = dispatch(req, ctx, manager, ip_limiter).await;
-
-    tracing::info!(
-        target: "access",
-        method = %method,
-        path = %path,
-        status = resp.status().as_u16(),
-        duration_ms = start.elapsed().as_millis() as u64,
-        ip = %ip,
-        "request",
-    );
-    Ok(resp)
-}
-
-async fn dispatch(
-    req: Request<Incoming>,
-    ctx: ReqCtx,
-    manager: Arc<Manager>,
-    ip_limiter: Option<Arc<IPLimiter>>,
-) -> Response<BoxedBody> {
-    if manager.config().prometheus_enabled && req.uri().path() == "/metrics" {
-        return metrics_endpoint(&ctx, ip_limiter.as_deref());
-    }
-    let path = req.uri().path();
-    if path.starts_with("/ddos-proxy/admin") {
-        return admin::handle(req, ctx, manager).await;
-    }
-    let cfg = manager.config();
-    if cfg.healthz_enabled && path == cfg.healthz_path {
-        return health::handle(manager.proxy(), &cfg.healthz_backend_path.clone()).await;
-    }
-    manager.handle(req, ctx).await
-}
-
-fn metrics_endpoint(ctx: &ReqCtx, ip_limiter: Option<&IPLimiter>) -> Response<BoxedBody> {
-    let ip = ctx
-        .remote_addr
-        .rsplit_once(':')
-        .map(|(h, _)| h.trim_matches(|c| c == '[' || c == ']').to_string())
-        .unwrap_or_else(|| ctx.remote_addr.clone());
-
-    if let Some(limiter) = ip_limiter {
-        if !limiter.allow(&ip) {
-            metrics::dropped("metrics_rate_limit");
-            let mut resp = Response::new(full("Too Many Requests\n"));
-            *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
-            return resp;
-        }
-    }
-
-    let (buf, content_type) = metrics::gather();
-    let mut resp = Response::new(full(buf));
-    resp.headers_mut().insert(
-        http::header::CONTENT_TYPE,
-        http::HeaderValue::from_str(&content_type).unwrap(),
-    );
-    resp
-}
-
-/// Future that resolves on SIGINT or SIGTERM.
-pub fn signal_future() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
-    Box::pin(async move {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut sigterm = signal(SignalKind::terminate()).unwrap();
-            let mut sigint = signal(SignalKind::interrupt()).unwrap();
-            tokio::select! {
-                _ = sigterm.recv() => {}
-                _ = sigint.recv() => {}
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = tokio::signal::ctrl_c().await;
-        }
-    })
-}
 
 /// Per-second XDP stats logging + metrics, mirroring the Go goroutine, plus the
 /// L4-flood detection state machine that drives Discord alerts.
@@ -328,17 +201,10 @@ fn spawn_xdp_stats(
     cfg: Arc<Config>,
     alerter: Option<Arc<discord::DiscordAlerter>>,
 ) {
-    use crate::discord::{L4Event, L4Reasons};
+    use ddos_proxy::discord::{L4Event, L4Reasons};
 
-    // Seconds between progress updates while a flood is ongoing.
     const L4_UPDATE_INTERVAL: i64 = 180;
-    // Minimum seconds between two successive Start alerts. Applies both to the
-    // initial Start and to any re-Start after an all-clear, preventing flap-spam
-    // when an attack is intermittent (burst/pause/burst pattern).
-    const L4_INITIAL_COOLDOWN: i64 = 300; // 5 minutes
-    // Consecutive sub-threshold seconds required before declaring all-clear.
-    // Longer grace means brief pauses in an ongoing attack don't trigger a
-    // premature Clear → Start cycle.
+    const L4_INITIAL_COOLDOWN: i64 = 300;
     const L4_CLEAR_GRACE: u32 = 10;
 
     tokio::spawn(async move {
@@ -353,7 +219,6 @@ fn spawn_xdp_stats(
         let mut l4_peak_pps: u64 = 0;
         let mut below_count: u32 = 0;
 
-        // Saturating per-second delta that tolerates counter resets/wraps.
         let delta = |cur: u64, prev: u64| if cur >= prev { cur - prev } else { cur };
 
         ticker.tick().await;
@@ -370,16 +235,16 @@ fn spawn_xdp_stats(
             let delta_allowed = delta(stats.allowed, prev.allowed);
             let delta_blocked = delta(stats.blocked, prev.blocked);
             let reasons = L4Reasons {
-                blocklist:    delta(stats.drop_blocklist,     prev.drop_blocklist),
-                udp:          delta(stats.drop_udp,           prev.drop_udp),
-                tcp_malformed:delta(stats.drop_tcp_malformed, prev.drop_tcp_malformed),
-                http_invalid: delta(stats.drop_http_invalid,  prev.drop_http_invalid),
-                tls_invalid:  delta(stats.drop_tls_invalid,   prev.drop_tls_invalid),
-                icmp:         delta(stats.drop_icmp,          prev.drop_icmp),
-                bad_flags:    delta(stats.drop_bad_flags,     prev.drop_bad_flags),
-                fragment:     delta(stats.drop_fragment,      prev.drop_fragment),
-                amplify:      delta(stats.drop_amplify,       prev.drop_amplify),
-                syn_flood:    delta(stats.drop_syn_flood,     prev.drop_syn_flood),
+                blocklist:     delta(stats.drop_blocklist,      prev.drop_blocklist),
+                udp:           delta(stats.drop_udp,            prev.drop_udp),
+                tcp_malformed: delta(stats.drop_tcp_malformed,  prev.drop_tcp_malformed),
+                http_invalid:  delta(stats.drop_http_invalid,   prev.drop_http_invalid),
+                tls_invalid:   delta(stats.drop_tls_invalid,    prev.drop_tls_invalid),
+                icmp:          delta(stats.drop_icmp,           prev.drop_icmp),
+                bad_flags:     delta(stats.drop_bad_flags,      prev.drop_bad_flags),
+                fragment:      delta(stats.drop_fragment,       prev.drop_fragment),
+                amplify:       delta(stats.drop_amplify,        prev.drop_amplify),
+                syn_flood:     delta(stats.drop_syn_flood,      prev.drop_syn_flood),
             };
 
             if delta_allowed > 0 || delta_blocked > 0 {
@@ -411,7 +276,6 @@ fn spawn_xdp_stats(
                 }
             }
 
-            // ── L4 flood alert state machine ──────────────────────────────────
             let pps = delta_blocked;
             let (dominant_type, _) = discord::classify_l4_reasons(&reasons);
 
@@ -426,9 +290,7 @@ fn spawn_xdp_stats(
                 let now = unix_secs();
                 if pps >= threshold as u64 {
                     below_count = 0;
-                    if pps > l4_peak_pps {
-                        l4_peak_pps = pps;
-                    }
+                    if pps > l4_peak_pps { l4_peak_pps = pps; }
                     if !l4_active {
                         if now - l4_last_sent_at >= L4_INITIAL_COOLDOWN {
                             l4_active = true;
@@ -453,12 +315,8 @@ fn spawn_xdp_stats(
                         if let Some(a) = &alerter {
                             a.notify_l4(
                                 L4Event::Clear { duration_secs },
-                                pps,
-                                l4_peak_pps,
-                                reasons,
-                                Vec::new(),
-                            )
-                            .await;
+                                pps, l4_peak_pps, reasons, Vec::new(),
+                            ).await;
                         }
                         let _ = blocker.clear_fingerprints();
                         l4_active = false;
@@ -474,7 +332,6 @@ fn spawn_xdp_stats(
     });
 }
 
-/// Current Unix time in seconds.
 #[cfg(all(target_os = "linux", feature = "xdp"))]
 fn unix_secs() -> i64 {
     std::time::SystemTime::now()

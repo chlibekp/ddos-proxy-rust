@@ -181,6 +181,33 @@ pub struct Config {
 #[derive(Debug)]
 pub struct MissingBackendURL;
 
+/// Override bag for `Config::for_test`.  Every field is `Option<T>`; `None`
+/// means "use the test default".  Only used in `#[cfg(test)]` / test helpers.
+#[cfg(any(test, feature = "testing"))]
+#[derive(Default)]
+pub struct TestCfgOverride {
+    pub backend_retries: Option<u32>,
+    pub backend_timeout_ms: Option<u64>,
+    pub always_on: Option<bool>,
+    pub trusted_ips: Option<Vec<String>>,
+    pub deny_ips: Option<Vec<String>>,
+    pub blocked_paths: Option<Vec<String>>,
+    pub honeypot_paths: Option<Vec<String>>,
+    pub blocked_ua: Option<Vec<String>>,
+    pub require_ua: Option<bool>,
+    pub max_uri_len: Option<usize>,
+    pub allowed_methods: Option<Vec<String>>,
+    pub allowed_hosts: Option<Vec<String>>,
+    pub cookie_challenge: Option<bool>,
+    pub pow_difficulty: Option<usize>,
+    pub max_req_per_ip: Option<i64>,
+    pub max_404_per_ip: Option<i64>,
+    pub exempt_paths: Option<Vec<String>>,
+    pub cache_enabled: Option<bool>,
+    pub serve_stale: Option<bool>,
+    pub request_id: Option<bool>,
+}
+
 fn env_nonempty(key: &str) -> Option<String> {
     match env::var(key) {
         Ok(v) if !v.is_empty() => Some(v),
@@ -426,9 +453,12 @@ impl Config {
             .and_then(|s| s.parse::<i64>().ok())
             .filter(|&v| v > 0);
 
+        // Default 1 retry: transparently recovers from a stale pooled connection
+        // (the most common cause of alternating 502s on HTML responses, where the
+        // body is buffered and the connection is returned to the pool early).
         let backend_retries = env_nonempty("PROXY_BACKEND_RETRIES")
             .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(0)
+            .unwrap_or(1)
             .min(5);
 
         let cb_threshold = env_nonempty("PROXY_CB_THRESHOLD")
@@ -557,6 +587,106 @@ impl Config {
             compression,
             pow_difficulty_attack,
             path_rate_limits,
+        })
+    }
+
+    /// Construct a `Config` with safe test defaults, pointing at `backend_url`.
+    /// All rate limits are effectively disabled; no challenges, no TLS.
+    /// Only fields present in `overrides` differ from the defaults.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn for_test(backend_url: &str, overrides: crate::config::TestCfgOverride) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Config {
+            backend_url: backend_url.to_string(),
+            port: "0".to_string(),
+            http_port: "0".to_string(),
+            max_req_per_sec: 1_000_000,
+            max_conn_per_sec: 1_000_000,
+            verify_time: Duration::from_secs(3600),
+            mitigation_time: Duration::from_secs(300),
+            turnstile_site_key: String::new(),
+            turnstile_secret_key: String::new(),
+            always_on: overrides.always_on.unwrap_or(false),
+            use_forwarded_for: false,
+            cloudflare_support: false,
+            whitelisted_ua: Vec::new(),
+            whitelist_rate_limit: 1_000_000,
+            max_failed_challenges: 100,
+            prometheus_enabled: false,
+            block_action: "403".to_string(),
+            auto_mitigation_on_timeout: false,
+            max_timeouts: 100,
+            timeout_threshold: Duration::from_secs(30),
+            cache_enabled: overrides.cache_enabled.unwrap_or(false),
+            enable_ssl: false,
+            acme_staging: false,
+            acme_directory_url: String::new(),
+            acme_email: String::new(),
+            acme_eab_key_id: String::new(),
+            acme_eab_hmac: String::new(),
+            xdp_interface: String::new(),
+            pow_difficulty: overrides.pow_difficulty.unwrap_or(1),
+            max_ip_states: 100_000,
+            cookie_challenge: overrides.cookie_challenge.unwrap_or(true),
+            max_req_per_ip: overrides.max_req_per_ip,
+            admin_secret: None,
+            healthz_enabled: true,
+            healthz_path: "/healthz".to_string(),
+            healthz_backend_path: "/".to_string(),
+            discord_webhook_url: None,
+            max_verify_attempts: 100,
+            xdp_alert_pps: 0,
+            trusted_ips: overrides
+                .trusted_ips
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|s| crate::netmatch::IpCidr::parse(s))
+                .collect(),
+            deny_ips: overrides
+                .deny_ips
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|s| crate::netmatch::IpCidr::parse(s))
+                .collect(),
+            blocked_ua: overrides
+                .blocked_ua
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| s.to_lowercase())
+                .collect(),
+            exempt_paths: overrides.exempt_paths.unwrap_or_default(),
+            backend_timeout: Duration::from_millis(
+                overrides.backend_timeout_ms.unwrap_or(5_000),
+            ),
+            max_body_size: None,
+            allowed_methods: overrides.allowed_methods.unwrap_or_default(),
+            security_headers: false,
+            access_log: false,
+            blocked_paths: overrides.blocked_paths.unwrap_or_default(),
+            block_regex: None,
+            allowed_hosts: overrides
+                .allowed_hosts
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| s.to_lowercase())
+                .collect(),
+            require_ua: overrides.require_ua.unwrap_or(false),
+            max_uri_len: overrides.max_uri_len,
+            honeypot_paths: overrides.honeypot_paths.unwrap_or_default(),
+            max_404_per_ip: overrides.max_404_per_ip,
+            basic_auth: None,
+            max_concurrent_per_ip: None,
+            max_inflight: None,
+            backend_retries: overrides.backend_retries.unwrap_or(1),
+            cb_threshold: 0,
+            cb_cooldown: Duration::from_secs(30),
+            serve_stale: overrides.serve_stale.unwrap_or(false),
+            request_id: overrides.request_id.unwrap_or(false),
+            add_headers: Vec::new(),
+            remove_headers: Vec::new(),
+            cors_origin: None,
+            compression: false,
+            pow_difficulty_attack: None,
+            path_rate_limits: Vec::new(),
         })
     }
 }

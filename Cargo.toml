@@ -5,6 +5,10 @@ edition = "2021"
 rust-version = "1.82"
 description = "High-performance DDoS protection reverse proxy (Rust port of the Go implementation)"
 
+[lib]
+name = "ddos_proxy"
+path = "src/lib.rs"
+
 [[bin]]
 name = "ddos-proxy"
 path = "src/main.rs"
@@ -13,6 +17,8 @@ path = "src/main.rs"
 default = []
 # Linux-only L4 blocking via eBPF/XDP. Loads the precompiled bpf object with aya.
 xdp = ["dep:aya", "dep:aya-log"]
+# Exposes test helper constructors (Config::for_test, TestCfgOverride) to integration tests.
+testing = []
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -63,6 +69,17 @@ dashmap = "6"
 # XDP (Linux only, optional)
 aya = { version = "0.13", optional = true }
 aya-log = { version = "0.2", optional = true }
+
+[[test]]
+name = "smoke"
+path = "tests/smoke.rs"
+required-features = ["testing"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+http-body-util = "0.1"
 
 [profile.release]
 opt-level = 3
