@@ -131,7 +131,12 @@ impl ResolverInner {
     }
 
     /// Host policy: only issue if the backend answers 200 on `/` for this host.
+    /// Set `PROXY_ACME_SKIP_HOST_POLICY=true` to bypass the probe entirely.
     async fn host_policy_ok(&self, host: &str) -> bool {
+        if self.cfg.acme_skip_host_policy {
+            tracing::info!(host = host, "ACME host policy skipped (PROXY_ACME_SKIP_HOST_POLICY)");
+            return true;
+        }
         let url = format!("{}/", self.cfg.backend_url.trim_end_matches('/'));
         let client = match reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
@@ -151,8 +156,11 @@ impl ResolverInner {
                 ok
             }
             Err(e) => {
-                tracing::error!(host = host, error = %e, "ACME host policy backend probe failed");
-                false
+                // Connection failure (backend temporarily unreachable) is not evidence
+                // that the host is illegitimate — fail open so a backend restart doesn't
+                // permanently block cert issuance for valid hosts.
+                tracing::warn!(host = host, error = %e, "ACME host policy backend probe failed; allowing issuance");
+                true
             }
         }
     }
