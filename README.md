@@ -59,7 +59,7 @@ The proxy is configured via environment variables.
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `PROXY_BACKEND_URL` | **Required** | The full URL of the backend service (e.g. `http://localhost:3000`). |
-| `PORT` | `8080` | The port the proxy listens on. |
+| `PORT` | `8080` (or `443` when `PROXY_ENABLE_SSL=true`) | The port the proxy listens on. |
 | `PROXY_MAX_REQ` | `300` | Max global requests per second before triggering mitigation. |
 | `PROXY_MAX_CONN` | `50` | Max global new connections per second before triggering mitigation. |
 | `PROXY_MAX_REQ_PER_IP` | `0` (off) | Max requests per second from a single IP before that IP is served the WAF challenge. Unlike `PROXY_MAX_REQ`, exceeding this limit only challenges the offending IP and does not trigger a global mitigation window for all clients. Blocked and verified IPs are exempt. Set to `0` or omit to disable. |
