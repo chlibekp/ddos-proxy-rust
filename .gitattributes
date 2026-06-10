@@ -1,2 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Vendor directory must not have line endings altered — cargo verifies checksums
+vendor/** -text
