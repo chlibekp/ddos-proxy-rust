@@ -1256,11 +1256,12 @@ impl Manager {
             let hash_hex = hex::encode(hasher.finalize());
             // Verify against the difficulty this client was actually issued
             // (adaptive difficulty may differ from the current base setting).
-            let difficulty = if issued_difficulty > 0 {
+            let difficulty = (if issued_difficulty > 0 {
                 issued_difficulty
             } else {
                 self.cfg.pow_difficulty
-            };
+            })
+            .max(1);
             let target_prefix = "0".repeat(difficulty);
             if !hash_hex.starts_with(&target_prefix) {
                 if self.prom() {
