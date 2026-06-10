@@ -49,17 +49,19 @@ impl DiskCache {
         if data.len() < 8 {
             return None;
         }
-        let meta_len = u64::from_le_bytes(data[..8].try_into().ok()?) as usize;
-        if data.len() < 8 + meta_len {
+        let meta_len_u64 = u64::from_le_bytes(data[..8].try_into().ok()?);
+        let meta_len = usize::try_from(meta_len_u64).ok()?;
+        let end = 8usize.checked_add(meta_len)?;
+        if data.len() < end {
             return None;
         }
-        let meta: Meta = serde_json::from_slice(&data[8..8 + meta_len]).ok()?;
+        let meta: Meta = serde_json::from_slice(&data[8..end]).ok()?;
         if unix_now() >= meta.expires_at {
             // Stale — drop it.
             let _ = std::fs::remove_file(&path);
             return None;
         }
-        let body = Bytes::copy_from_slice(&data[8 + meta_len..]);
+        let body = Bytes::copy_from_slice(&data[end..]);
         Some(StoredResponse {
             status: meta.status,
             headers: meta.headers,
@@ -75,12 +77,14 @@ impl DiskCache {
         if data.len() < 8 {
             return None;
         }
-        let meta_len = u64::from_le_bytes(data[..8].try_into().ok()?) as usize;
-        if data.len() < 8 + meta_len {
+        let meta_len_u64 = u64::from_le_bytes(data[..8].try_into().ok()?);
+        let meta_len = usize::try_from(meta_len_u64).ok()?;
+        let end = 8usize.checked_add(meta_len)?;
+        if data.len() < end {
             return None;
         }
-        let meta: Meta = serde_json::from_slice(&data[8..8 + meta_len]).ok()?;
-        let body = Bytes::copy_from_slice(&data[8 + meta_len..]);
+        let meta: Meta = serde_json::from_slice(&data[8..end]).ok()?;
+        let body = Bytes::copy_from_slice(&data[end..]);
         Some(StoredResponse {
             status: meta.status,
             headers: meta.headers,

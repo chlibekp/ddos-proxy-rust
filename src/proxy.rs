@@ -21,7 +21,7 @@ use crate::util::is_websocket_upgrade;
 const JS_SNIPPET: &[u8] = br#"<script>(function(){var r=function(){window.location.reload()};var c=function(h){if(h==='challenge')r()};var f=window.fetch;if(f){window.fetch=function(){return f.apply(this,arguments).then(function(res){if(res&&res.headers&&res.headers.get){c(res.headers.get('X-Mitigation'))}return res})}}var x=XMLHttpRequest.prototype;var o=x.open;x.open=function(){this.addEventListener('load',function(){if(this.getResponseHeader){c(this.getResponseHeader('X-Mitigation'))}});return o.apply(this,arguments)};if(window.fetch){document.addEventListener('error',function(e){var t=e.target;if(t&&t.tagName&&(t.src||t.href)){var g=t.tagName;if(g==='IMG'||g==='SCRIPT'||g==='LINK'||g==='IFRAME'||g==='VIDEO'||g==='AUDIO'){var u=t.src||t.href;if(u&&u.indexOf('data:')!==0){window.fetch(u,{method:'HEAD'}).catch(function(){})}}}},true)}})();</script>"#;
 
 static CC_NORMALIZE_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"(max-age|s-maxage)\s+(\d+)").unwrap());
+    Lazy::new(|| Regex::new(r"(max-age|s-maxage)\s*=?\s*(\d+)").unwrap());
 
 const HOP_BY_HOP: &[&str] = &[
     "connection",
@@ -604,7 +604,14 @@ impl Proxy {
             }
 
             let decoded: Vec<u8> = if ce == "gzip" {
-                decode_gzip(&bytes).unwrap_or_else(|| bytes.to_vec())
+                match decode_gzip(&bytes) {
+                    Some(d) => d,
+                    None => {
+                        // Gzip decode failed — skip injection, return original response.
+                        strip_hop_by_hop(&mut parts.headers);
+                        return Response::from_parts(parts, full(bytes));
+                    }
+                }
             } else {
                 bytes.to_vec()
             };

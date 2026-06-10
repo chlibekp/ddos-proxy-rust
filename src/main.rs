@@ -279,7 +279,7 @@ fn metrics_endpoint(ctx: &ReqCtx, ip_limiter: Option<&IPLimiter>) -> Response<Bo
     let ip = ctx
         .remote_addr
         .rsplit_once(':')
-        .map(|(h, _)| h.to_string())
+        .map(|(h, _)| h.trim_matches(|c| c == '[' || c == ']').to_string())
         .unwrap_or_else(|| ctx.remote_addr.clone());
 
     if let Some(limiter) = ip_limiter {
