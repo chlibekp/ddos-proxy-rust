@@ -98,6 +98,20 @@ pub async fn handle(req: Request<Incoming>, ctx: ReqCtx, manager: Arc<Manager>) 
             ),
         },
 
+        // Maintenance mode: GET reads, POST enables, DELETE disables.
+        ("GET", "/ddos-proxy/admin/maintenance") => {
+            let body = format!(r#"{{"maintenance":{}}}"#, manager.maintenance_active());
+            json(StatusCode::OK, &body)
+        }
+        ("POST", "/ddos-proxy/admin/maintenance") => {
+            manager.set_maintenance(true);
+            json(StatusCode::OK, r#"{"ok":true,"maintenance":true}"#)
+        }
+        ("DELETE", "/ddos-proxy/admin/maintenance") => {
+            manager.set_maintenance(false);
+            json(StatusCode::OK, r#"{"ok":true,"maintenance":false}"#)
+        }
+
         // Manually unblock an IP+host pair.
         ("DELETE", "/ddos-proxy/admin/block") => match read_block_req(req).await {
             Some((ip, host)) => {
@@ -259,6 +273,11 @@ tr:hover td{background:#1e293b}
       <div class="label">Tracked IPs</div>
       <div class="val" id="val-ips">—</div>
     </div>
+    <div class="card" id="card-maint">
+      <div class="label">Maintenance</div>
+      <div class="val" id="val-maint">—</div>
+      <button id="maint-btn" style="margin-top:8px;padding:4px 12px;border:1px solid #475569;border-radius:5px;background:transparent;color:#94a3b8;cursor:pointer;font-size:12px" onclick="toggleMaintenance()">Toggle</button>
+    </div>
   </div>
 
   <div class="block-form">
@@ -296,6 +315,7 @@ tr:hover td{background:#1e293b}
 const TOKEN_KEY = 'ddos_admin_token';
 let token = sessionStorage.getItem(TOKEN_KEY) || '';
 let refreshTimer = null;
+let maintActive = false;
 
 function api(path, opts = {}) {
   return fetch(path, {
@@ -359,6 +379,10 @@ async function refresh() {
   js.className = 'card ' + (status.js_challenge_active ? 'warn' : 'ok');
   document.getElementById('val-js').textContent = status.js_challenge_active ? 'ACTIVE' : 'Off';
   document.getElementById('val-ips').textContent = status.ip_state_count;
+  const maint = document.getElementById('card-maint');
+  maint.className = 'card ' + (status.maintenance_active ? 'warn' : 'ok');
+  document.getElementById('val-maint').textContent = status.maintenance_active ? 'ON' : 'Off';
+  maintActive = !!status.maintenance_active;
 
   const states = await statesResp.json();
   const tbody = document.getElementById('states-body');
@@ -393,6 +417,13 @@ async function blockIP() {
   const r = await api('/ddos-proxy/admin/block', { method: 'POST', body: JSON.stringify({ ip, host }) });
   if (r.ok) { toast('Blocked ' + ip); refresh(); document.getElementById('f-ip').value = ''; document.getElementById('f-host').value = ''; }
   else toast('Error blocking', false);
+}
+
+async function toggleMaintenance() {
+  const method = maintActive ? 'DELETE' : 'POST';
+  const r = await api('/ddos-proxy/admin/maintenance', { method });
+  if (r.ok) { toast('Maintenance ' + (maintActive ? 'disabled' : 'enabled')); refresh(); }
+  else toast('Error toggling maintenance', false);
 }
 
 async function blockKey(key) {
@@ -488,6 +519,15 @@ mod tests {
             discord_webhook_url: None,
             max_verify_attempts: 5,
             xdp_alert_pps: 1000,
+            trusted_ips: vec![],
+            deny_ips: vec![],
+            blocked_ua: vec![],
+            exempt_paths: vec![],
+            backend_timeout: Duration::from_secs(30),
+            max_body_size: None,
+            allowed_methods: vec![],
+            security_headers: false,
+            access_log: false,
         });
         let rl = Arc::new(RateLimiter::new());
         let target: http::Uri = "http://127.0.0.1:8081".parse().unwrap();
@@ -551,6 +591,18 @@ mod tests {
         assert!(!s.mitigation_active);
         assert!(!s.js_challenge_active);
         assert_eq!(s.ip_state_count, 0);
+    }
+
+    #[tokio::test]
+    async fn maintenance_mode_toggles() {
+        let manager = make_manager(Some("secret"));
+        assert!(!manager.maintenance_active());
+        manager.set_maintenance(true);
+        assert!(manager.maintenance_active());
+        assert!(manager.get_status().maintenance_active);
+        manager.set_maintenance(false);
+        assert!(!manager.maintenance_active());
+        assert!(!manager.get_status().maintenance_active);
     }
 
     #[tokio::test]

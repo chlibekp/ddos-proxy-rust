@@ -2,7 +2,7 @@ mod client;
 
 pub use client::ClientState;
 
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -34,6 +34,10 @@ pub struct Manager {
     mitigation_until: AtomicI64,   // unix seconds
     mitigation_started_at: AtomicI64, // unix seconds; when the current mitigation window began
     js_challenge_until: AtomicI64, // unix seconds; while set, escalate cookie→JS challenge
+    /// Admin-toggled maintenance mode: while set, all WAF-routed traffic gets a
+    /// 503 maintenance page (the admin API itself is routed before the WAF and
+    /// stays reachable to turn it back off).
+    maintenance_mode: AtomicBool,
     timeout_count: AtomicI64,
     ip_states: DashMap<String, Arc<ClientState>>,
     ip_state_count: AtomicI64,
@@ -72,6 +76,7 @@ impl Manager {
             mitigation_until: AtomicI64::new(0),
             mitigation_started_at: AtomicI64::new(0),
             js_challenge_until: AtomicI64::new(0),
+            maintenance_mode: AtomicBool::new(false),
             timeout_count: AtomicI64::new(0),
             ip_states: DashMap::new(),
             ip_state_count: AtomicI64::new(0),
@@ -410,6 +415,66 @@ impl Manager {
         // alerter can report true incoming traffic rate, not just proxied requests.
         self.rl.inc_total();
 
+        // ── Maintenance mode ─────────────────────────────────────────────
+        if self.maintenance_mode.load(Ordering::SeqCst) {
+            if self.prom() {
+                metrics::dropped("maintenance");
+            }
+            return maintenance_response();
+        }
+
+        // ── HTTP method allowlist ────────────────────────────────────────
+        if !self.cfg.allowed_methods.is_empty()
+            && !self
+                .cfg
+                .allowed_methods
+                .iter()
+                .any(|m| m == req.method().as_str())
+        {
+            if self.prom() {
+                metrics::dropped("method_not_allowed");
+            }
+            return text_response(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed");
+        }
+
+        // ── Declared body-size cap ───────────────────────────────────────
+        // Checked against Content-Length only: the proxy streams bodies, so this
+        // rejects declared oversized uploads cheaply before they hit the backend.
+        if let Some(max) = self.cfg.max_body_size {
+            let declared = req
+                .headers()
+                .get(http::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok());
+            if declared.is_some_and(|len| len > max) {
+                if self.prom() {
+                    metrics::dropped("body_too_large");
+                }
+                return text_response(StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large");
+            }
+        }
+
+        let ip = self.get_client_ip(&req, &ctx);
+
+        // ── IP denylist: always blocked, before anything else ────────────
+        if crate::netmatch::ip_in_list(&ip, &self.cfg.deny_ips) {
+            if self.prom() {
+                metrics::dropped("ip_denylist");
+            }
+            if self.cfg.block_action == "close" {
+                return close_response();
+            }
+            return forbidden_response();
+        }
+
+        // ── Trusted IPs bypass the WAF entirely ──────────────────────────
+        if crate::netmatch::ip_in_list(&ip, &self.cfg.trusted_ips) {
+            if self.prom() {
+                metrics::allowed("trusted_ip");
+            }
+            return self.proxy.handle(req, &ctx).await;
+        }
+
         if is_websocket_upgrade(&req) {
             return self.proxy.handle(req, &ctx).await;
         }
@@ -420,6 +485,17 @@ impl Manager {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
+
+        // Blocked UA check (known-bad bots / scrapers).
+        if !self.cfg.blocked_ua.is_empty() {
+            let ua_lower = ua.to_lowercase();
+            if self.cfg.blocked_ua.iter().any(|bad| ua_lower.contains(bad.as_str())) {
+                if self.prom() {
+                    metrics::dropped("ua_denylist");
+                }
+                return forbidden_response();
+            }
+        }
 
         // Whitelisted UA check.
         if !self.cfg.whitelisted_ua.is_empty() {
@@ -440,7 +516,6 @@ impl Manager {
             }
         }
 
-        let ip = self.get_client_ip(&req, &ctx);
         let host = req
             .headers()
             .get(http::header::HOST)
@@ -494,6 +569,23 @@ impl Manager {
                 }
                 return forbidden_response();
             }
+        }
+
+        // ── Challenge-exempt paths ───────────────────────────────────────
+        // Webhooks / machine-to-machine endpoints that can't solve challenges.
+        // Placed after the blocked fast-path so blocked IPs stay blocked here,
+        // but before any challenge logic so these paths are never challenged.
+        if self
+            .cfg
+            .exempt_paths
+            .iter()
+            .any(|prefix| path.starts_with(prefix.as_str()))
+        {
+            self.rl.inc_req();
+            if self.prom() {
+                metrics::allowed("exempt_path");
+            }
+            return self.proxy.handle(req, &ctx).await;
         }
 
         // ── Verified fast-path ───────────────────────────────────────────
@@ -900,6 +992,7 @@ pub struct MitigationStatus {
     pub js_challenge_active: bool,
     pub js_challenge_until_unix: i64,
     pub ip_state_count: i64,
+    pub maintenance_active: bool,
 }
 
 impl Manager {
@@ -956,7 +1049,20 @@ impl Manager {
             js_challenge_active: now_s < js_challenge_until,
             js_challenge_until_unix: js_challenge_until,
             ip_state_count: self.ip_state_count.load(Ordering::SeqCst),
+            maintenance_active: self.maintenance_active(),
         }
+    }
+
+    /// Whether admin-toggled maintenance mode is currently on.
+    pub fn maintenance_active(&self) -> bool {
+        self.maintenance_mode.load(Ordering::SeqCst)
+    }
+
+    /// Toggle maintenance mode. While on, every WAF-routed request receives a
+    /// 503 maintenance page; `/metrics`, `/healthz` and the admin API stay up.
+    pub fn set_maintenance(&self, on: bool) {
+        self.maintenance_mode.store(on, Ordering::SeqCst);
+        tracing::info!(enabled = on, "Admin: maintenance mode toggled");
     }
 
     /// Administratively block an IP+host. Creates the client state if needed.
@@ -1066,6 +1172,34 @@ fn close_response() -> Response<BoxedBody> {
     *resp.status_mut() = StatusCode::FORBIDDEN;
     resp.headers_mut()
         .insert(http::header::CONNECTION, HeaderValue::from_static("close"));
+    resp
+}
+
+/// 503 page served while maintenance mode is on.
+fn maintenance_response() -> Response<BoxedBody> {
+    const MAINTENANCE_HTML: &str = "<!DOCTYPE html>\
+<html lang=\"en\"><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+<title>Maintenance</title>\
+<style>body{font-family:system-ui,sans-serif;background:#0f1117;color:#e2e8f0;\
+display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}\
+div{text-align:center}h1{font-size:1.6rem;margin-bottom:8px}p{color:#94a3b8}</style>\
+</head><body><div><h1>We&rsquo;ll be right back</h1>\
+<p>This site is undergoing scheduled maintenance. Please try again shortly.</p>\
+</div></body></html>";
+
+    let mut resp = Response::new(full(MAINTENANCE_HTML));
+    *resp.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+    let h = resp.headers_mut();
+    h.insert(
+        http::header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    h.insert(http::header::RETRY_AFTER, HeaderValue::from_static("300"));
+    h.insert(
+        http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache, no-store, must-revalidate"),
+    );
     resp
 }
 
