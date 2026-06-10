@@ -16,9 +16,9 @@ COPY . .
 # eBPF/XDP Layer-4 blocking (Linux only). build.rs compiles src/bpf/xdp.c with clang.
 ARG FEATURES=""
 RUN if [ -n "$FEATURES" ]; then \
-        cargo build --release --features "$FEATURES"; \
+        cargo build --release --offline --features "$FEATURES"; \
     else \
-        cargo build --release; \
+        cargo build --release --offline; \
     fi
 
 # Runtime stage
