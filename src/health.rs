@@ -15,7 +15,7 @@ use crate::proxy::Proxy;
 /// This endpoint bypasses the WAF and requires no authentication, making it
 /// safe for use by Kubernetes liveness/readiness probes and load-balancer checks.
 pub async fn handle(proxy: Arc<Proxy>, backend_path: &str) -> Response<BoxedBody> {
-    match proxy.health_check(backend_path).await {
+    match proxy.cached_health_check(backend_path).await {
         Ok(status) if status.is_success() || status.is_redirection() => {
             metrics::HEALTHZ_CHECKS.with_label_values(&["ok"]).inc();
             json_response(StatusCode::OK, r#"{"status":"ok","backend":"reachable"}"#)
@@ -30,7 +30,7 @@ pub async fn handle(proxy: Arc<Proxy>, backend_path: &str) -> Response<BoxedBody
         }
         Err(e) => {
             metrics::HEALTHZ_CHECKS.with_label_values(&["error"]).inc();
-            let msg = e.to_string().replace('"', "\\\"");
+            let msg = e.replace('"', "\\\"");
             let body = format!(
                 r#"{{"status":"degraded","backend":"unreachable","error":"{}"}}"#,
                 msg

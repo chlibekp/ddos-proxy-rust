@@ -52,6 +52,13 @@ pub struct ReqCtx {
     pub remote_addr: String,
 }
 
+/// Cached outcome of a backend health probe (clonable so it can be stored).
+#[derive(Clone)]
+enum HealthOutcome {
+    Ok(StatusCode),
+    Err(String),
+}
+
 pub struct Proxy {
     target: Uri,
     target_host: String,
@@ -59,6 +66,10 @@ pub struct Proxy {
     cfg: Arc<Config>,
     client: ProxyClient,
     cache: Option<crate::cache::DiskCache>,
+    /// Last health-probe result, reused for up to 1s so that flooding `/healthz`
+    /// (which is unauthenticated and WAF-exempt) can't amplify into a flood of
+    /// backend probes.
+    health_cache: std::sync::Mutex<Option<(std::time::Instant, HealthOutcome)>>,
 }
 
 impl Proxy {
@@ -96,6 +107,7 @@ impl Proxy {
             cfg,
             client,
             cache,
+            health_cache: std::sync::Mutex::new(None),
         }
     }
 
@@ -120,6 +132,33 @@ impl Proxy {
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
         Ok(resp.status())
+    }
+
+    /// Health probe with a 1-second result cache. Returns `Ok(status)` on a
+    /// successful probe or `Err(message)` on failure. The cache bounds backend
+    /// load to at most one probe per second regardless of inbound `/healthz` rate.
+    pub async fn cached_health_check(&self, path: &str) -> Result<StatusCode, String> {
+        const TTL: Duration = Duration::from_secs(1);
+        if let Ok(guard) = self.health_cache.lock() {
+            if let Some((at, outcome)) = guard.as_ref() {
+                if at.elapsed() < TTL {
+                    return match outcome {
+                        HealthOutcome::Ok(s) => Ok(*s),
+                        HealthOutcome::Err(e) => Err(e.clone()),
+                    };
+                }
+            }
+        }
+
+        let result = self.health_check(path).await.map_err(|e| e.to_string());
+        let outcome = match &result {
+            Ok(s) => HealthOutcome::Ok(*s),
+            Err(e) => HealthOutcome::Err(e.clone()),
+        };
+        if let Ok(mut guard) = self.health_cache.lock() {
+            *guard = Some((std::time::Instant::now(), outcome));
+        }
+        result
     }
 
     /// Main proxy entry point. Forwards `req` to the backend, applying the same
@@ -223,11 +262,15 @@ impl Proxy {
         }
     }
 
-    /// Cache key mirroring Go's httpcache: GET uses the (backend) URL string.
+    /// Cache key for a GET request. Includes the inbound `Host` so responses for
+    /// different inbound hosts proxied to the same backend can't collide and serve
+    /// one host's content to another (the Host is forwarded upstream, so the
+    /// backend may produce different bodies per host).
     fn cache_key<B>(&self, req: &Request<B>) -> String {
         let pq = req.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/");
         let joined = join_path(self.target.path(), pq);
-        format!("{}://{}{}", self.target_scheme, self.target_host, joined)
+        let host = host_header(req).unwrap_or_default();
+        format!("{}://{}{}|host={}", self.target_scheme, self.target_host, joined, host)
     }
 
     /// Build the outbound request from the inbound one (non-websocket path).
