@@ -51,6 +51,16 @@ const ISSUE_RATE_WINDOW_SECS: i64 = 60;
 
 type Challenges = Arc<DashMap<String, String>>; // token -> key authorization
 
+/// On-disk record of a persisted ACME account. Generic over the credentials type
+/// so we can serialize from a borrowed `&AccountCredentials` and deserialize into
+/// an owned one. `directory` binds the record to the ACME server it was created
+/// against, so a staging↔production switch transparently provisions a new account.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredAccount<C = instant_acme::AccountCredentials> {
+    directory: String,
+    credentials: C,
+}
+
 struct CachedCert {
     key: Arc<CertifiedKey>,
     renew_at: i64,
@@ -169,6 +179,15 @@ impl ResolverInner {
                     LetsEncrypt::Production.url().to_string()
                 };
 
+                // Reuse a previously persisted account so we don't call newAccount
+                // on every restart (Let's Encrypt rate-limits account creation, and
+                // a fresh account each run discards prior authorizations). The stored
+                // record is bound to the directory URL it was created against — if
+                // the directory changes (e.g. staging↔production) we issue a new one.
+                if let Some(account) = self.load_account(&directory).await {
+                    return Ok::<Arc<Account>, String>(account);
+                }
+
                 let eab = build_eab(&self.cfg)?;
 
                 let contact_storage;
@@ -179,7 +198,7 @@ impl ResolverInner {
                     Vec::new()
                 };
 
-                let (account, _creds) = Account::create(
+                let (account, creds) = Account::create(
                     &NewAccount {
                         contact: &contact,
                         terms_of_service_agreed: true,
@@ -190,10 +209,56 @@ impl ResolverInner {
                 )
                 .await
                 .map_err(|e| format!("ACME account creation failed: {e}"))?;
+
+                self.save_account(&directory, &creds);
                 Ok::<Arc<Account>, String>(Arc::new(account))
             })
             .await
             .cloned()
+    }
+
+    /// Load a persisted ACME account bound to `directory`, if one exists and can
+    /// be restored. Returns `None` (so the caller creates a fresh account) on any
+    /// error — a corrupt or stale record must never block issuance.
+    async fn load_account(&self, directory: &str) -> Option<Arc<Account>> {
+        let raw = std::fs::read_to_string(self.account_path()).ok()?;
+        let stored: StoredAccount = serde_json::from_str(&raw).ok()?;
+        if stored.directory != directory {
+            tracing::info!(
+                "Stored ACME account was created for a different directory; creating a new one"
+            );
+            return None;
+        }
+        match Account::from_credentials(stored.credentials).await {
+            Ok(account) => {
+                tracing::info!("Restored ACME account from disk");
+                Some(Arc::new(account))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to restore ACME account from disk; creating a new one");
+                None
+            }
+        }
+    }
+
+    /// Persist the freshly created account credentials for reuse across restarts.
+    fn save_account(&self, directory: &str, creds: &instant_acme::AccountCredentials) {
+        let stored = StoredAccount {
+            directory: directory.to_string(),
+            credentials: creds,
+        };
+        match serde_json::to_string(&stored) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(self.account_path(), json) {
+                    tracing::warn!(error = %e, "Failed to persist ACME account to disk");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "Failed to serialize ACME account"),
+        }
+    }
+
+    fn account_path(&self) -> PathBuf {
+        self.cert_dir.join("account.json")
     }
 
     async fn issue(&self, host: &str) -> Result<CachedCert, String> {
