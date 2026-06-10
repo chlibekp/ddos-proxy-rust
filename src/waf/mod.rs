@@ -1048,6 +1048,43 @@ impl Manager {
                     }
                     return self.proxy.handle(req, &ctx).await;
                 }
+                // Track cookie-challenge failures and escalate to a block + XDP
+                // drop once max_failed_challenges is exceeded, matching the JS/PoW
+                // escalation path. Bots that ignore cookies will be dropped at L4
+                // immediately rather than being served the challenge forever.
+                let blocked_now = {
+                    let mut inner = state.inner.lock().unwrap();
+                    if !inner.challenge_served {
+                        inner.challenge_served = true;
+                        inner.violation_count = 0;
+                        false
+                    } else {
+                        inner.violation_count += 1;
+                        if inner.violation_count > self.cfg.max_failed_challenges {
+                            inner.blocked = true;
+                            inner.blocked_at_ms = now_ms;
+                            state.blocked_flag.store(true, Ordering::SeqCst);
+                            if !self.cfg.cloudflare_support && !self.cfg.use_forwarded_for {
+                                inner.l4_blocked = true;
+                            }
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                };
+                if blocked_now {
+                    if !self.cfg.cloudflare_support && !self.cfg.use_forwarded_for {
+                        self.block_l4(&ip);
+                    }
+                    if self.prom() {
+                        metrics::dropped("challenge_violation");
+                    }
+                    if self.cfg.block_action == "close" {
+                        return close_response();
+                    }
+                    return forbidden_response();
+                }
                 if self.prom() {
                     metrics::challenged();
                 }
