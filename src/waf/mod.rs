@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 use crate::body::{empty, full, BoxedBody};
 use crate::config::Config;
 use crate::discord::DiscordAlerter;
+use crate::slack::SlackAlerter;
 use crate::limiter::RateLimiter;
 use crate::metrics;
 use crate::netmatch::IpCidr;
@@ -32,6 +33,7 @@ pub struct Manager {
     xdp: Option<Arc<dyn Blocker>>,
     proxy: Arc<Proxy>,
     alerter: Option<Arc<DiscordAlerter>>,
+    slack_alerter: Option<Arc<SlackAlerter>>,
     mitigation_until: AtomicI64,   // unix seconds
     mitigation_started_at: AtomicI64, // unix seconds; when the current mitigation window began
     js_challenge_until: AtomicI64, // unix seconds; while set, escalate cookie→JS challenge
@@ -103,6 +105,7 @@ impl Manager {
         xdp: Option<Arc<dyn Blocker>>,
         proxy: Arc<Proxy>,
         alerter: Option<Arc<DiscordAlerter>>,
+        slack_alerter: Option<Arc<SlackAlerter>>,
     ) -> Arc<Self> {
         let mut env = Environment::new();
         env.add_template_owned("challenge.html", template_src)
@@ -126,6 +129,7 @@ impl Manager {
             xdp,
             proxy,
             alerter,
+            slack_alerter,
             inflight: Arc::new(AtomicI64::new(0)),
             dyn_deny: std::sync::RwLock::new(Vec::new()),
             dyn_trust: std::sync::RwLock::new(Vec::new()),
@@ -993,19 +997,28 @@ impl Manager {
                 .store(now_s + mitigation_secs, Ordering::SeqCst);
             should_serve_challenge = true;
 
-            // Notify the Discord alerter of the new/extended mitigation window.
+            // Notify the Discord and Slack alerters of the new/extended mitigation window.
+            let mitigation_end = now_s + mitigation_secs;
+            let tracked = self.ip_state_count.load(Ordering::SeqCst);
             if let Some(alerter) = &self.alerter {
                 let alerter = alerter.clone();
-                let mitigation_end = now_s + mitigation_secs;
-                let tracked = self.ip_state_count.load(Ordering::SeqCst);
+                tokio::spawn(async move {
+                    alerter.notify_mitigation_active(mitigation_end, tracked).await;
+                });
+            }
+            if let Some(alerter) = &self.slack_alerter {
+                let alerter = alerter.clone();
                 tokio::spawn(async move {
                     alerter.notify_mitigation_active(mitigation_end, tracked).await;
                 });
             }
         } else if now_s < mitigation_until {
             should_serve_challenge = true;
-            // Keep the alerter's IP count fresh while the attack is ongoing.
+            // Keep the alerters' IP counts fresh while the attack is ongoing.
             if let Some(alerter) = &self.alerter {
+                alerter.update_ips(self.ip_state_count.load(Ordering::SeqCst));
+            }
+            if let Some(alerter) = &self.slack_alerter {
                 alerter.update_ips(self.ip_state_count.load(Ordering::SeqCst));
             }
         } else if self.cfg.auto_mitigation_on_timeout

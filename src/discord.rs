@@ -271,6 +271,7 @@ impl DiscordAlerter {
 // ─── L4 / XDP flood alerting ──────────────────────────────────────────────────
 
 /// Which point in the L4-flood lifecycle an alert represents.
+#[derive(Clone)]
 pub enum L4Event {
     /// First detection — packets/sec crossed the alert threshold.
     Start,

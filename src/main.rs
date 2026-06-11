@@ -11,6 +11,7 @@ mod limiter;
 mod metrics;
 mod netmatch;
 mod proxy;
+mod slack;
 mod tls;
 mod util;
 mod waf;
@@ -86,6 +87,16 @@ async fn main() {
             discord::DiscordAlerter::new(u.to_string(), cfg.max_req_per_sec, rl.clone())
         });
 
+    // Slack alerter (optional). Runs alongside Discord — both can be active at once.
+    let slack_alerter = cfg
+        .slack_webhook_url
+        .as_deref()
+        .filter(|u| !u.is_empty())
+        .map(|u| {
+            tracing::info!(webhook = "<redacted>", "Slack DDoS alerting enabled");
+            slack::SlackAlerter::new(u.to_string(), cfg.max_req_per_sec, rl.clone())
+        });
+
     // XDP blocker (optional, Linux + feature `xdp`).
     let xdp_blocker: Option<Arc<dyn xdp::Blocker>> = if !cfg.xdp_interface.is_empty() {
         #[cfg(all(target_os = "linux", feature = "xdp"))]
@@ -94,7 +105,7 @@ async fn main() {
             match xdp::init_xdp(&cfg.xdp_interface) {
                 Ok(b) => {
                     let blocker: Arc<dyn xdp::Blocker> = Arc::new(b);
-                    spawn_xdp_stats(blocker.clone(), cfg.clone(), alerter.clone());
+                    spawn_xdp_stats(blocker.clone(), cfg.clone(), alerter.clone(), slack_alerter.clone());
                     Some(blocker)
                 }
                 Err(e) => {
@@ -122,7 +133,7 @@ async fn main() {
 
     let proxy = Arc::new(Proxy::new(target.clone(), cfg.clone()));
 
-    let manager = Manager::new(cfg.clone(), rl.clone(), template_src, xdp_blocker, proxy, alerter);
+    let manager = Manager::new(cfg.clone(), rl.clone(), template_src, xdp_blocker, proxy, alerter, slack_alerter);
 
     // Rate limiter reset ticker (every second).
     {
@@ -327,6 +338,7 @@ fn spawn_xdp_stats(
     blocker: Arc<dyn xdp::Blocker>,
     cfg: Arc<Config>,
     alerter: Option<Arc<discord::DiscordAlerter>>,
+    slack_alerter: Option<Arc<slack::SlackAlerter>>,
 ) {
     use crate::discord::{L4Event, L4Reasons};
 
@@ -346,7 +358,7 @@ fn spawn_xdp_stats(
         let mut prev = blocker.get_stats().unwrap_or_default();
 
         let threshold = cfg.xdp_alert_pps;
-        let l4_enabled = alerter.is_some() && threshold > 0;
+        let l4_enabled = (alerter.is_some() || slack_alerter.is_some()) && threshold > 0;
         let mut l4_active = false;
         let mut l4_started_at: i64 = 0;
         let mut l4_last_sent_at: i64 = 0;
@@ -436,6 +448,9 @@ fn spawn_xdp_stats(
                             l4_last_sent_at = now;
                             let fps = blocker.top_fingerprints(3).unwrap_or_default();
                             if let Some(a) = &alerter {
+                                a.notify_l4(L4Event::Start, pps, l4_peak_pps, reasons, fps.clone()).await;
+                            }
+                            if let Some(a) = &slack_alerter {
                                 a.notify_l4(L4Event::Start, pps, l4_peak_pps, reasons, fps).await;
                             }
                         }
@@ -443,6 +458,9 @@ fn spawn_xdp_stats(
                         l4_last_sent_at = now;
                         let fps = blocker.top_fingerprints(3).unwrap_or_default();
                         if let Some(a) = &alerter {
+                            a.notify_l4(L4Event::Update, pps, l4_peak_pps, reasons, fps.clone()).await;
+                        }
+                        if let Some(a) = &slack_alerter {
                             a.notify_l4(L4Event::Update, pps, l4_peak_pps, reasons, fps).await;
                         }
                     }
@@ -451,6 +469,16 @@ fn spawn_xdp_stats(
                     if below_count >= L4_CLEAR_GRACE {
                         let duration_secs = now - l4_started_at;
                         if let Some(a) = &alerter {
+                            a.notify_l4(
+                                L4Event::Clear { duration_secs },
+                                pps,
+                                l4_peak_pps,
+                                reasons,
+                                Vec::new(),
+                            )
+                            .await;
+                        }
+                        if let Some(a) = &slack_alerter {
                             a.notify_l4(
                                 L4Event::Clear { duration_secs },
                                 pps,

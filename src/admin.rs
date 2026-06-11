@@ -257,6 +257,7 @@ fn config_json(manager: &Manager) -> String {
         "enable_ssl": c.enable_ssl,
         "xdp_interface": c.xdp_interface,
         "discord_alerts": c.discord_webhook_url.is_some(),
+        "slack_alerts": c.slack_webhook_url.is_some(),
         "max_ip_states": c.max_ip_states,
         "max_inflight": c.max_inflight,
         "max_concurrent_per_ip": c.max_concurrent_per_ip,
@@ -650,6 +651,7 @@ mod tests {
             healthz_path: "/healthz".to_string(),
             healthz_backend_path: "/".to_string(),
             discord_webhook_url: None,
+            slack_webhook_url: None,
             max_verify_attempts: 5,
             xdp_alert_pps: 1000,
             trusted_ips: vec![],
@@ -686,7 +688,7 @@ mod tests {
         let rl = Arc::new(RateLimiter::new());
         let target: http::Uri = "http://127.0.0.1:8081".parse().unwrap();
         let proxy = Arc::new(Proxy::new(target, cfg.clone()));
-        Manager::new(cfg, rl, "<html></html>".to_string(), None, proxy, None)
+        Manager::new(cfg, rl, "<html></html>".to_string(), None, proxy, None, None)
     }
 
     #[tokio::test]

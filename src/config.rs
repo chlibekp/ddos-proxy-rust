@@ -57,6 +57,12 @@ pub struct Config {
     /// `None` disables alerting.
     pub discord_webhook_url: Option<String>,
 
+    /// Optional Slack incoming-webhook URL for DDoS/suspicious-traffic alerts.
+    /// Sends the same lifecycle (initial → update → all-clear) as the Discord alerter
+    /// but formatted as Slack Block Kit messages. Set via `PROXY_SLACK_WEBHOOK_URL`.
+    /// `None` disables Slack alerting.
+    pub slack_webhook_url: Option<String>,
+
     /// Maximum number of failed `/challenge/verify` submissions an IP may make in a
     /// 60-second window before the endpoint returns 429.  Default: 5.
     /// Set via `PROXY_MAX_VERIFY_ATTEMPTS`.
@@ -323,6 +329,7 @@ impl Config {
         let healthz_backend_path = env_nonempty("PROXY_HEALTHZ_BACKEND_PATH").unwrap_or_else(|| "/".to_string());
 
         let discord_webhook_url = env_nonempty("PROXY_DISCORD_WEBHOOK_URL");
+        let slack_webhook_url = env_nonempty("PROXY_SLACK_WEBHOOK_URL");
 
         let max_verify_attempts = env_nonempty("PROXY_MAX_VERIFY_ATTEMPTS")
             .and_then(|s| s.parse::<i64>().ok())
@@ -525,6 +532,7 @@ impl Config {
             healthz_path,
             healthz_backend_path,
             discord_webhook_url,
+            slack_webhook_url,
             max_verify_attempts,
             xdp_alert_pps,
             trusted_ips,
