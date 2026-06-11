@@ -40,29 +40,31 @@ pub static ALLOWED_REQUESTS: Lazy<IntCounterVec> = Lazy::new(|| {
     c
 });
 
+/// Unified XDP packet-disposition counter. Every packet seen by the XDP program
+/// lands in exactly one `action` bucket, so `sum(ddos_proxy_xdp_packets_total)`
+/// equals the total packet count and any subset can be queried directly.
+///
+/// `action` values:
+///   passed               — forwarded to the kernel (XDP_PASS)
+///   dropped_blocklist    — source IP on the static blocklist
+///   dropped_udp          — UDP flood on service port (80/443)
+///   dropped_amplify      — UDP from a known reflection/amplification source port
+///   dropped_icmp         — ICMP echo request flood
+///   dropped_tcp_malformed— truncated or malformed TCP / invalid IP header length
+///   dropped_bad_flags    — NULL / Xmas / SYN+FIN / RST+SYN flag combinations
+///   dropped_fragment     — IP fragmentation (MF bit or non-zero offset)
+///   dropped_http_invalid — :80 payload that is not a valid HTTP request line
+///   dropped_tls_invalid  — :443 payload that is not a TLS ClientHello
+///   dropped_syn_flood    — SYN rate-limit exceeded for this source IP
+///   syn_challenged       — SYN-ACK challenge emitted via XDP_TX (RST-cookie auth)
+///   syn_validated        — returning RST matched the cookie; source whitelisted
 pub static XDP_PACKETS: Lazy<IntCounterVec> = Lazy::new(|| {
     let c = IntCounterVec::new(
         Opts::new(
             "ddos_proxy_xdp_packets_total",
-            "The total number of packets processed by XDP",
+            "XDP packet dispositions — every packet lands in exactly one action bucket",
         ),
         &["action"],
-    )
-    .unwrap();
-    REGISTRY.register(Box::new(c.clone())).unwrap();
-    c
-});
-
-/// XDP-dropped packets broken down by drop reason (blocklist, udp, tcp_malformed,
-/// http_invalid, tls_invalid). Complements `XDP_PACKETS{action="blocked"}` with
-/// the *why*, so the dominant attack vector is visible in Prometheus/Grafana.
-pub static XDP_DROPS: Lazy<IntCounterVec> = Lazy::new(|| {
-    let c = IntCounterVec::new(
-        Opts::new(
-            "ddos_proxy_xdp_drops_total",
-            "Total packets dropped by XDP, broken down by drop reason",
-        ),
-        &["reason"],
     )
     .unwrap();
     REGISTRY.register(Box::new(c.clone())).unwrap();
@@ -355,13 +357,22 @@ pub fn init() {
     let _ = &*VERIFIED_CLIENTS;
     let _ = &*BACKEND_RETRIES;
     let _ = &*PATH_RATE_LIMITED;
-    XDP_PACKETS.with_label_values(&["allowed"]).inc_by(0);
-    XDP_PACKETS.with_label_values(&["blocked"]).inc_by(0);
-    for reason in [
-        "blocklist", "udp", "tcp_malformed", "http_invalid", "tls_invalid",
-        "icmp", "bad_flags", "fragment", "amplify", "syn_flood",
+    for action in [
+        "passed",
+        "dropped_blocklist",
+        "dropped_udp",
+        "dropped_amplify",
+        "dropped_icmp",
+        "dropped_tcp_malformed",
+        "dropped_bad_flags",
+        "dropped_fragment",
+        "dropped_http_invalid",
+        "dropped_tls_invalid",
+        "dropped_syn_flood",
+        "syn_challenged",
+        "syn_validated",
     ] {
-        XDP_DROPS.with_label_values(&[reason]).inc_by(0);
+        XDP_PACKETS.with_label_values(&[action]).inc_by(0);
     }
     // Touch the L4-flood gauges so all label combinations appear on first scrape.
     for attack_type in [

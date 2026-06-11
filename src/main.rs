@@ -71,8 +71,17 @@ async fn main() {
     let xdp_blocker: Option<Arc<dyn xdp::Blocker>> = if !cfg.xdp_interface.is_empty() {
         #[cfg(all(target_os = "linux", feature = "xdp"))]
         {
-            tracing::info!(interface = %cfg.xdp_interface, "Initializing XDP blocker");
-            match xdp::init_xdp(&cfg.xdp_interface) {
+            tracing::info!(
+                interface = %cfg.xdp_interface,
+                syn_auth = cfg.xdp_syn_auth,
+                syn_auth_pps = cfg.xdp_syn_auth_pps,
+                "Initializing XDP blocker"
+            );
+            let syn_auth = xdp::SynAuthConfig {
+                enabled: cfg.xdp_syn_auth,
+                pps_threshold: cfg.xdp_syn_auth_pps.max(0) as u32,
+            };
+            match xdp::init_xdp(&cfg.xdp_interface, syn_auth) {
                 Ok(b) => {
                     let blocker: Arc<dyn xdp::Blocker> = Arc::new(b);
                     spawn_xdp_stats(blocker.clone(), cfg.clone(), alerter.clone());
@@ -247,31 +256,38 @@ fn spawn_xdp_stats(
                 syn_flood:     delta(stats.drop_syn_flood,      prev.drop_syn_flood),
             };
 
+            let delta_challenged = delta(stats.syn_challenged, prev.syn_challenged);
+            let delta_validated = delta(stats.syn_validated, prev.syn_validated);
+
             if delta_allowed > 0 || delta_blocked > 0 {
                 tracing::info!(allowed = delta_allowed, blocked = delta_blocked, "XDP Stats (per sec)");
             }
+            if delta_challenged > 0 || delta_validated > 0 {
+                tracing::info!(
+                    challenged = delta_challenged,
+                    validated = delta_validated,
+                    "XDP SYN-cookie auth (per sec)"
+                );
+            }
 
             if cfg.prometheus_enabled {
-                if delta_allowed > 0 {
-                    metrics::XDP_PACKETS.with_label_values(&["allowed"]).inc_by(delta_allowed);
-                }
-                if delta_blocked > 0 {
-                    metrics::XDP_PACKETS.with_label_values(&["blocked"]).inc_by(delta_blocked);
-                }
-                for (reason, n) in [
-                    ("blocklist",     reasons.blocklist),
-                    ("udp",           reasons.udp),
-                    ("tcp_malformed", reasons.tcp_malformed),
-                    ("http_invalid",  reasons.http_invalid),
-                    ("tls_invalid",   reasons.tls_invalid),
-                    ("icmp",          reasons.icmp),
-                    ("bad_flags",     reasons.bad_flags),
-                    ("fragment",      reasons.fragment),
-                    ("amplify",       reasons.amplify),
-                    ("syn_flood",     reasons.syn_flood),
+                for (action, n) in [
+                    ("passed",                delta_allowed),
+                    ("dropped_blocklist",     reasons.blocklist),
+                    ("dropped_udp",           reasons.udp),
+                    ("dropped_amplify",       reasons.amplify),
+                    ("dropped_icmp",          reasons.icmp),
+                    ("dropped_tcp_malformed", reasons.tcp_malformed),
+                    ("dropped_bad_flags",     reasons.bad_flags),
+                    ("dropped_fragment",      reasons.fragment),
+                    ("dropped_http_invalid",  reasons.http_invalid),
+                    ("dropped_tls_invalid",   reasons.tls_invalid),
+                    ("dropped_syn_flood",     reasons.syn_flood),
+                    ("syn_challenged",        delta_challenged),
+                    ("syn_validated",         delta_validated),
                 ] {
                     if n > 0 {
-                        metrics::XDP_DROPS.with_label_values(&[reason]).inc_by(n);
+                        metrics::XDP_PACKETS.with_label_values(&[action]).inc_by(n);
                     }
                 }
             }

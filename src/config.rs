@@ -68,6 +68,18 @@ pub struct Config {
     /// `PROXY_XDP_INTERFACE` and `PROXY_DISCORD_WEBHOOK_URL` are configured.
     pub xdp_alert_pps: i64,
 
+    /// Enable the XDP SYN-cookie (RST-cookie) authentication layer. When a TCP
+    /// SYN flood is detected at L4 the kernel program answers new SYNs with a
+    /// bogus SYN-ACK and only lets through sources that prove themselves by
+    /// replying with a RST. Set via `PROXY_XDP_SYN_AUTH` (default false). Only
+    /// meaningful when `PROXY_XDP_INTERFACE` is set and the binary is built with
+    /// the `xdp` feature.
+    pub xdp_syn_auth: bool,
+    /// Aggregate SYN/s threshold that engages cookie challenging. Below it the
+    /// program keeps its per-source SYN rate limiting. Default: 2000. Set via
+    /// `PROXY_XDP_SYN_AUTH_PPS`.
+    pub xdp_syn_auth_pps: i64,
+
     /// IPs/CIDRs that bypass the WAF entirely (monitoring probes, internal
     /// infrastructure, office ranges). Set via `PROXY_TRUSTED_IPS`
     /// (comma-separated, e.g. `10.0.0.0/8,192.168.1.5,2001:db8::/32`).
@@ -360,6 +372,12 @@ impl Config {
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(1000);
 
+        let xdp_syn_auth = parse_bool("PROXY_XDP_SYN_AUTH");
+        let xdp_syn_auth_pps = env_nonempty("PROXY_XDP_SYN_AUTH_PPS")
+            .and_then(|s| s.parse::<i64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(2000);
+
         let trusted_ips = env_nonempty("PROXY_TRUSTED_IPS")
             .map(|s| crate::netmatch::parse_cidr_list(&s))
             .unwrap_or_default();
@@ -557,6 +575,8 @@ impl Config {
             discord_webhook_url,
             max_verify_attempts,
             xdp_alert_pps,
+            xdp_syn_auth,
+            xdp_syn_auth_pps,
             trusted_ips,
             deny_ips,
             blocked_ua,
@@ -635,6 +655,8 @@ impl Config {
             discord_webhook_url: None,
             max_verify_attempts: 100,
             xdp_alert_pps: 0,
+            xdp_syn_auth: false,
+            xdp_syn_auth_pps: 2000,
             trusted_ips: overrides
                 .trusted_ips
                 .unwrap_or_default()

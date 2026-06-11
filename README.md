@@ -90,6 +90,8 @@ The proxy is configured via environment variables.
 | `PROXY_HTTP_PORT` | `80` | Port for the HTTP→HTTPS redirect server and ACME HTTP-01 challenges (SSL only). |
 | `PROXY_XDP_INTERFACE` | `""` | Network interface to attach the XDP program to (e.g. `eth0`). Requires the `xdp` build feature plus `NET_ADMIN`, `SYS_ADMIN`, `BPF` capabilities. |
 | `PROXY_XDP_ALERT_PPS` | `1000` | Dropped-packets-per-second threshold (measured at the XDP/L4 layer) above which a Discord **L4-flood** alert fires. `0` or less disables L4 alerting. Only active when both `PROXY_XDP_INTERFACE` and `PROXY_DISCORD_WEBHOOK_URL` are set. |
+| `PROXY_XDP_SYN_AUTH` | `false` | Enable XDP **SYN-cookie (RST-cookie) authentication**. When a TCP SYN flood is detected at L4, the XDP program answers new SYNs with a deliberately invalid SYN-ACK; only sources that reply with the expected RST (proving they are real, non-spoofed TCP stacks) are whitelisted and allowed through. Requires `PROXY_XDP_INTERFACE` and the `xdp` build feature. |
+| `PROXY_XDP_SYN_AUTH_PPS` | `2000` | Aggregate SYN/s across all sources that engages cookie challenging. Below this rate the program falls back to per-source SYN rate limiting; challenging only kicks in once the global SYN rate crosses the threshold. Only meaningful with `PROXY_XDP_SYN_AUTH=true`. |
 | `PROXY_MAX_IP_STATES` | `500000` | Cap on tracked client IP states (0 = unlimited) to bound memory under spoofed floods. |
 | `PROXY_DISCORD_WEBHOOK_URL` | `""` | Discord incoming-webhook URL. When set, a rich embed is posted to this channel whenever mitigation mode is triggered by sustained traffic exceeding **500 req/min** (~8.3 req/s). Alerts are rate-limited to at most **one per minute** to prevent webhook spam. Leave empty to disable. |
 | `PROXY_TRUSTED_IPS` | `""` | Comma-separated IPs/CIDRs (IPv4 + IPv6) that bypass the WAF entirely (e.g. `10.0.0.0/8,192.168.1.5,2001:db8::/32`). Use for monitoring probes and internal infrastructure. |
@@ -189,6 +191,98 @@ When using `PROXY_XDP_INTERFACE`, the container requires:
 2. **Capabilities**: `NET_ADMIN`, `SYS_ADMIN`, `BPF`.
 3. The image built with `--build-arg FEATURES=xdp`.
 
+### XDP SYN-cookie authentication (`PROXY_XDP_SYN_AUTH`)
+
+A spoofed TCP SYN flood can't be distinguished from legitimate connection setup
+by rate alone — the attacker sprays random source IPs, each below any per-IP cap.
+When `PROXY_XDP_SYN_AUTH=true` the XDP program adds a stateless **RST-cookie**
+challenge that engages automatically once the aggregate SYN rate crosses
+`PROXY_XDP_SYN_AUTH_PPS`.
+
+**Challenge handshake**
+
+1. A new SYN is answered (via `XDP_TX`) with a SYN-ACK whose acknowledgment field
+   carries a cookie derived from the 4-tuple and a per-process secret.
+2. A genuine client's TCP stack rejects the unacceptable ACK and replies with a
+   `RST` whose sequence number equals the cookie (RFC 793 SYN-SENT behaviour).
+3. Seeing that RST proves the source completed a round-trip (not spoofed), so its
+   IP is whitelisted in a kernel-side map; the client's SYN retransmit then passes
+   through to the kernel and the real handshake proceeds normally. Spoofed sources
+   never send the RST and are never admitted.
+
+**When does it engage?**
+
+The XDP program maintains a global SYN counter that resets every second. The
+challenge is **inactive** by default; it latches on once the counter crosses
+`PROXY_XDP_SYN_AUTH_PPS` in the current window:
+
+```
+second 0:  1,500 SYN/s  → not engaged, per-source rate limiting only
+second 1:  3,000 SYN/s  → latches ON at packet #2001, cookies issued for rest of window
+second 2:  3,000 SYN/s  → latches ON again almost immediately (window resets each second)
+second 3:    200 SYN/s  → not engaged (flood stopped), back to per-source rate limiting
+```
+
+The latch resets to zero at the start of each 1-second window — there is no
+sticky cooldown. During a sustained flood the threshold is crossed again within
+the first few packets of each new window, so challenging resumes instantly. Once
+the flood stops, the very next window starts clean and real clients are no longer
+challenged.
+
+Below the threshold, the existing **per-source SYN rate limiter** still applies
+(100 SYN/s per IP, configurable via `SYN_MAX_PER_SEC` in the eBPF source).
+
+**Metrics and observability**
+
+All XDP packet dispositions are exported as a single unified counter
+`ddos_proxy_xdp_packets_total{action}`. Every packet lands in exactly one bucket,
+so `sum(ddos_proxy_xdp_packets_total)` equals the total packet count.
+
+| `action` label | Meaning |
+|----------------|---------|
+| `passed` | Forwarded to the kernel (XDP_PASS) |
+| `dropped_syn_flood` | SYN rate-limit exceeded for this source IP |
+| `dropped_udp` | UDP flood on service port (80/443) |
+| `dropped_amplify` | UDP from a known reflection/amplification source port |
+| `dropped_icmp` | ICMP echo request flood |
+| `dropped_bad_flags` | NULL / Xmas / SYN+FIN / RST+SYN TCP flag combinations |
+| `dropped_fragment` | IP fragmentation (MF bit or non-zero fragment offset) |
+| `dropped_http_invalid` | :80 payload that is not a valid HTTP request line |
+| `dropped_tls_invalid` | :443 payload that is not a TLS ClientHello |
+| `dropped_tcp_malformed` | Truncated or malformed TCP / invalid IP header length |
+| `dropped_blocklist` | Source IP on the static blocklist |
+| `syn_challenged` | SYN-ACK challenge emitted via XDP_TX (RST-cookie auth) |
+| `syn_validated` | Returning RST matched the cookie; source IP whitelisted |
+
+Useful PromQL:
+
+```promql
+# Total dropped per attack type (rate over last minute)
+rate(ddos_proxy_xdp_packets_total{action=~"dropped_.*"}[1m])
+
+# Total dropped across all types
+sum(rate(ddos_proxy_xdp_packets_total{action=~"dropped_.*"}[1m]))
+
+# RST-cookie auth efficiency (validated / challenged)
+rate(ddos_proxy_xdp_packets_total{action="syn_validated"}[5m])
+  / rate(ddos_proxy_xdp_packets_total{action="syn_challenged"}[5m])
+```
+
+The ratio `syn_validated / syn_challenged` shows what fraction of challenged
+sources were real clients versus spoofed flood traffic. During a pure spoofed
+flood this approaches 0; during a high-rate DDoS from real (rented) bots it will
+be non-zero.
+
+**Caveats**
+
+- Real clients see roughly one TCP retransmit timeout (~1 s) of extra setup
+  latency while a flood is active (the SYN must be retransmitted after the RST
+  exchange).
+- Whitelisting is per source IP; clients behind a shared NAT are all admitted once
+  any one of them passes the challenge.
+- The cookie is stateless (no per-connection state in the kernel), so the program
+  scales to millions of spoofed sources with no memory growth.
+
 ## Discord DDoS Alerts
 
 When `PROXY_DISCORD_WEBHOOK_URL` is set the proxy posts a rich embed to your Discord channel every time it detects a sustained attack:
@@ -246,7 +340,7 @@ txt \x90\x00\x90\x00
 
 The fingerprint set is cleared at each all-clear so every attack window starts fresh. A header-only/volumetric flood (e.g. spoofed SYNs with no payload) records no fingerprint, which the alert states explicitly.
 
-**Prometheus** — the per-reason drop breakdown is also exported as `ddos_proxy_xdp_drops_total{reason="…"}` alongside the existing `ddos_proxy_xdp_packets_total`.
+**Prometheus** — attack dispositions are exported as `ddos_proxy_xdp_packets_total{action="dropped_syn_flood"|"dropped_udp"|…}` (see the XDP SYN-cookie section for the full label list and PromQL examples).
 
 ## Security Notes
 
