@@ -71,8 +71,17 @@ async fn main() {
     let xdp_blocker: Option<Arc<dyn xdp::Blocker>> = if !cfg.xdp_interface.is_empty() {
         #[cfg(all(target_os = "linux", feature = "xdp"))]
         {
-            tracing::info!(interface = %cfg.xdp_interface, "Initializing XDP blocker");
-            match xdp::init_xdp(&cfg.xdp_interface) {
+            tracing::info!(
+                interface = %cfg.xdp_interface,
+                syn_auth = cfg.xdp_syn_auth,
+                syn_auth_pps = cfg.xdp_syn_auth_pps,
+                "Initializing XDP blocker"
+            );
+            let syn_auth = xdp::SynAuthConfig {
+                enabled: cfg.xdp_syn_auth,
+                pps_threshold: cfg.xdp_syn_auth_pps.max(0) as u32,
+            };
+            match xdp::init_xdp(&cfg.xdp_interface, syn_auth) {
                 Ok(b) => {
                     let blocker: Arc<dyn xdp::Blocker> = Arc::new(b);
                     spawn_xdp_stats(blocker.clone(), cfg.clone(), alerter.clone());
@@ -247,8 +256,18 @@ fn spawn_xdp_stats(
                 syn_flood:     delta(stats.drop_syn_flood,      prev.drop_syn_flood),
             };
 
+            let delta_challenged = delta(stats.syn_challenged, prev.syn_challenged);
+            let delta_validated = delta(stats.syn_validated, prev.syn_validated);
+
             if delta_allowed > 0 || delta_blocked > 0 {
                 tracing::info!(allowed = delta_allowed, blocked = delta_blocked, "XDP Stats (per sec)");
+            }
+            if delta_challenged > 0 || delta_validated > 0 {
+                tracing::info!(
+                    challenged = delta_challenged,
+                    validated = delta_validated,
+                    "XDP SYN-cookie auth (per sec)"
+                );
             }
 
             if cfg.prometheus_enabled {
@@ -273,6 +292,12 @@ fn spawn_xdp_stats(
                     if n > 0 {
                         metrics::XDP_DROPS.with_label_values(&[reason]).inc_by(n);
                     }
+                }
+                if delta_challenged > 0 {
+                    metrics::XDP_SYN_AUTH.with_label_values(&["challenged"]).inc_by(delta_challenged);
+                }
+                if delta_validated > 0 {
+                    metrics::XDP_SYN_AUTH.with_label_values(&["validated"]).inc_by(delta_validated);
                 }
             }
 

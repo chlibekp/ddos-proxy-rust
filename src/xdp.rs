@@ -30,6 +30,10 @@ pub struct Stats {
     pub drop_fragment: u64,
     pub drop_amplify: u64,
     pub drop_syn_flood: u64,
+    /// RST-cookie SYN-ACK challenges emitted (XDP_TX) while under SYN flood.
+    pub syn_challenged: u64,
+    /// RST cookies validated, whitelisting the source IP.
+    pub syn_validated: u64,
 }
 
 /// A captured byte signature of repeatedly-dropped packets: the first
@@ -69,7 +73,7 @@ fn ipv4_key(ip: &str) -> Option<u32> {
 // ── Linux + feature `xdp`: real aya-backed implementation ────────────────────
 #[cfg(all(target_os = "linux", feature = "xdp"))]
 mod imp {
-    use super::{ipv4_key, Blocker, Fingerprint, Stats, FP_SAMPLE_LEN};
+    use super::{ipv4_key, Blocker, Fingerprint, Stats, SynAuthConfig, FP_SAMPLE_LEN};
     use aya::maps::{Array, HashMap as AyaHashMap};
     use aya::programs::{Xdp, XdpFlags};
     use aya::Ebpf;
@@ -93,8 +97,22 @@ mod imp {
         drop_fragment: u64,
         drop_amplify: u64,
         drop_syn_flood: u64,
+        syn_challenged: u64,
+        syn_validated: u64,
     }
     unsafe impl aya::Pod for BpfStats {}
+
+    // Layout must match `struct xdp_config` in src/bpf/xdp.c:
+    //   __u32 syn_auth_enabled; __u32 syn_auth_pps; __u32 cookie_secret; __u32 _pad;
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct BpfConfig {
+        syn_auth_enabled: u32,
+        syn_auth_pps: u32,
+        cookie_secret: u32,
+        _pad: u32,
+    }
+    unsafe impl aya::Pod for BpfConfig {}
 
     // Layout must match `struct fingerprint` in src/bpf/xdp.c:
     //   __u64 count; __u32 len; __u8 bytes[16];  (size 32, align 8)
@@ -112,8 +130,25 @@ mod imp {
     }
 
     impl XdpBlocker {
-        pub fn init(iface: &str) -> Result<Self, String> {
+        pub fn init(iface: &str, syn_auth: SynAuthConfig) -> Result<Self, String> {
             let mut ebpf = Ebpf::load(BPF_OBJECT).map_err(|e| format!("load BPF objects: {e}"))?;
+
+            // Populate the runtime config map before attaching so the program
+            // sees the SYN-auth settings (and a fresh random cookie secret) from
+            // its very first packet.
+            {
+                let mut cfg_map: Array<_, BpfConfig> =
+                    Array::try_from(ebpf.map_mut("xdp_cfg").ok_or("xdp_cfg map missing")?)
+                        .map_err(|e| e.to_string())?;
+                let cfg = BpfConfig {
+                    syn_auth_enabled: syn_auth.enabled as u32,
+                    syn_auth_pps: syn_auth.pps_threshold,
+                    cookie_secret: rand::random::<u32>(),
+                    _pad: 0,
+                };
+                cfg_map.set(0, cfg, 0).map_err(|e| e.to_string())?;
+            }
+
             let program: &mut Xdp = ebpf
                 .program_mut("xdp_drop_func")
                 .ok_or_else(|| "program xdp_drop_func not found".to_string())?
@@ -167,6 +202,8 @@ mod imp {
                 drop_fragment: s.drop_fragment,
                 drop_amplify: s.drop_amplify,
                 drop_syn_flood: s.drop_syn_flood,
+                syn_challenged: s.syn_challenged,
+                syn_validated: s.syn_validated,
             })
         }
 
@@ -206,20 +243,30 @@ mod imp {
         }
     }
 
-    pub fn init_xdp(iface: &str) -> Result<XdpBlocker, String> {
-        XdpBlocker::init(iface)
+    pub fn init_xdp(iface: &str, syn_auth: SynAuthConfig) -> Result<XdpBlocker, String> {
+        XdpBlocker::init(iface, syn_auth)
     }
 }
 
 #[cfg(all(target_os = "linux", feature = "xdp"))]
 pub use imp::{init_xdp, XdpBlocker};
 
+/// Runtime knobs for the XDP SYN-cookie (RST-cookie) authentication layer.
+#[derive(Clone, Copy, Debug)]
+pub struct SynAuthConfig {
+    /// Master switch (`PROXY_XDP_SYN_AUTH`). When false the kernel program keeps
+    /// its previous behaviour (per-source SYN rate limiting only).
+    pub enabled: bool,
+    /// Aggregate SYN/s that engages cookie challenging (`PROXY_XDP_SYN_AUTH_PPS`).
+    pub pps_threshold: u32,
+}
+
 /// Initialise XDP. On non-Linux / feature-disabled builds this always errors,
 /// so the caller leaves the blocker unset (no-op), exactly like Go when the
 /// interface is not configured.
 #[cfg(not(all(target_os = "linux", feature = "xdp")))]
 #[allow(dead_code)]
-pub fn init_xdp(_iface: &str) -> Result<NoopBlocker, String> {
+pub fn init_xdp(_iface: &str, _syn_auth: SynAuthConfig) -> Result<NoopBlocker, String> {
     Err("XDP support not compiled in (enable the `xdp` feature on Linux)".to_string())
 }
 

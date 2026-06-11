@@ -90,6 +90,8 @@ The proxy is configured via environment variables.
 | `PROXY_HTTP_PORT` | `80` | Port for the HTTP→HTTPS redirect server and ACME HTTP-01 challenges (SSL only). |
 | `PROXY_XDP_INTERFACE` | `""` | Network interface to attach the XDP program to (e.g. `eth0`). Requires the `xdp` build feature plus `NET_ADMIN`, `SYS_ADMIN`, `BPF` capabilities. |
 | `PROXY_XDP_ALERT_PPS` | `1000` | Dropped-packets-per-second threshold (measured at the XDP/L4 layer) above which a Discord **L4-flood** alert fires. `0` or less disables L4 alerting. Only active when both `PROXY_XDP_INTERFACE` and `PROXY_DISCORD_WEBHOOK_URL` are set. |
+| `PROXY_XDP_SYN_AUTH` | `false` | Enable XDP **SYN-cookie (RST-cookie) authentication**. When a TCP SYN flood is detected at L4, the XDP program answers new SYNs with a deliberately invalid SYN-ACK; only sources that reply with the expected RST (proving they are real, non-spoofed TCP stacks) are whitelisted and allowed through. Requires `PROXY_XDP_INTERFACE` and the `xdp` build feature. |
+| `PROXY_XDP_SYN_AUTH_PPS` | `2000` | Aggregate SYN/s across all sources that engages cookie challenging. Below this rate the program falls back to per-source SYN rate limiting; challenging only kicks in once the global SYN rate crosses the threshold. Only meaningful with `PROXY_XDP_SYN_AUTH=true`. |
 | `PROXY_MAX_IP_STATES` | `500000` | Cap on tracked client IP states (0 = unlimited) to bound memory under spoofed floods. |
 | `PROXY_DISCORD_WEBHOOK_URL` | `""` | Discord incoming-webhook URL. When set, a rich embed is posted to this channel whenever mitigation mode is triggered by sustained traffic exceeding **500 req/min** (~8.3 req/s). Alerts are rate-limited to at most **one per minute** to prevent webhook spam. Leave empty to disable. |
 | `PROXY_TRUSTED_IPS` | `""` | Comma-separated IPs/CIDRs (IPv4 + IPv6) that bypass the WAF entirely (e.g. `10.0.0.0/8,192.168.1.5,2001:db8::/32`). Use for monitoring probes and internal infrastructure. |
@@ -188,6 +190,31 @@ When using `PROXY_XDP_INTERFACE`, the container requires:
 1. **Host Network Mode**: `network_mode: "host"`.
 2. **Capabilities**: `NET_ADMIN`, `SYS_ADMIN`, `BPF`.
 3. The image built with `--build-arg FEATURES=xdp`.
+
+### XDP SYN-cookie authentication (`PROXY_XDP_SYN_AUTH`)
+
+A spoofed TCP SYN flood can't be distinguished from legitimate connection setup
+by rate alone — the attacker sprays random source IPs, each below any per-IP cap.
+When `PROXY_XDP_SYN_AUTH=true` the XDP program adds a stateless **RST-cookie**
+challenge that engages automatically once the aggregate SYN rate crosses
+`PROXY_XDP_SYN_AUTH_PPS`:
+
+1. A new SYN is answered (via `XDP_TX`) with a SYN-ACK whose acknowledgment field
+   carries a cookie derived from the 4-tuple and a per-process secret.
+2. A genuine client's TCP stack rejects the unacceptable ACK and replies with a
+   `RST` whose sequence number equals the cookie (RFC 793 SYN-SENT behaviour).
+3. Seeing that RST proves the source completed a round-trip (not spoofed), so its
+   IP is whitelisted; the client's SYN retransmit then passes through to the
+   kernel and the real handshake proceeds. Spoofed sources never send the RST and
+   are never whitelisted.
+
+Counters are exported as `ddos_proxy_xdp_syn_auth_total{event="challenged"|"validated"}`.
+
+Caveats: the challenge adds roughly one TCP retransmit timeout (~1 s) of setup
+latency for real clients while a flood is active; whitelisting is per source IP,
+so all clients behind a shared NAT are admitted together once one of them passes;
+and the cookie is encoded in the ACK field with TCP options left intact on the
+reply, since a SYN-SENT socket rejects the segment before they are processed.
 
 ## Discord DDoS Alerts
 

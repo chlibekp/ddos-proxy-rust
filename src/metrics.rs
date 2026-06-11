@@ -69,6 +69,23 @@ pub static XDP_DROPS: Lazy<IntCounterVec> = Lazy::new(|| {
     c
 });
 
+/// XDP SYN-cookie (RST-cookie) authentication events, labelled by `event`:
+/// `challenged` (a bogus SYN-ACK was emitted) and `validated` (a returning RST
+/// proved the source genuine and whitelisted it). The ratio shows how many
+/// challenged sources were real clients versus spoofed flood traffic.
+pub static XDP_SYN_AUTH: Lazy<IntCounterVec> = Lazy::new(|| {
+    let c = IntCounterVec::new(
+        Opts::new(
+            "ddos_proxy_xdp_syn_auth_total",
+            "XDP SYN-cookie authentication events (challenged/validated)",
+        ),
+        &["event"],
+    )
+    .unwrap();
+    REGISTRY.register(Box::new(c.clone())).unwrap();
+    c
+});
+
 /// Whether an L4/XDP flood is currently in progress, labelled by `attack_type`.
 /// The gauge is 1 while the flood is active and 0 once it clears. Having the
 /// attack type as a label means you can alert on a specific class (e.g. SYN flood)
@@ -362,6 +379,9 @@ pub fn init() {
         "icmp", "bad_flags", "fragment", "amplify", "syn_flood",
     ] {
         XDP_DROPS.with_label_values(&[reason]).inc_by(0);
+    }
+    for event in ["challenged", "validated"] {
+        XDP_SYN_AUTH.with_label_values(&[event]).inc_by(0);
     }
     // Touch the L4-flood gauges so all label combinations appear on first scrape.
     for attack_type in [

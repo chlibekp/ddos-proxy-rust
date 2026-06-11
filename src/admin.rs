@@ -652,6 +652,8 @@ mod tests {
             discord_webhook_url: None,
             max_verify_attempts: 5,
             xdp_alert_pps: 1000,
+            xdp_syn_auth: false,
+            xdp_syn_auth_pps: 2000,
             trusted_ips: vec![],
             deny_ips: vec![],
             blocked_ua: vec![],
