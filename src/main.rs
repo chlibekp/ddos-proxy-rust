@@ -173,12 +173,13 @@ async fn serve_plain(
                 let manager = manager.clone();
                 let ip_limiter = ip_limiter.clone();
                 let remote = peer.to_string();
+                let conn_info = Arc::new(ddos_proxy::conninfo::ConnInfo::from_stream(&stream));
                 tokio::spawn(async move {
                     let io = TokioIo::new(stream);
                     let service = service_fn(move |req: Request<Incoming>| {
                         let manager = manager.clone();
                         let ip_limiter = ip_limiter.clone();
-                        let ctx = ReqCtx { is_tls: false, remote_addr: remote.clone() };
+                        let ctx = ReqCtx::new(false, remote.clone(), Some(conn_info.clone()));
                         async move { route(req, ctx, manager, ip_limiter).await }
                     });
                     let _ = auto::Builder::new(TokioExecutor::new())

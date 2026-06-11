@@ -70,6 +70,10 @@ dashmap = "6"
 aya = { version = "0.13", optional = true }
 aya-log = { version = "0.2", optional = true }
 
+# TCP_INFO introspection for the X-Tcp response header (Linux)
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [[test]]
 name = "smoke"
 path = "tests/smoke.rs"

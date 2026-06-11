@@ -175,6 +175,16 @@ pub struct Config {
     /// like `/login` without global mitigation). Set via
     /// `PROXY_PATH_RATE_LIMITS` (e.g. `/login=5,/api=100`).
     pub path_rate_limits: Vec<(String, i64)>,
+    /// When true (default), every response carries a `Server-Timing` header
+    /// with the proxy's internal timing breakdown (`waf`, `cache`, `backend`,
+    /// `body`, `proc`, `tls` handshake, `total`), in milliseconds.
+    /// Disable with `PROXY_SERVER_TIMING=false`.
+    pub server_timing: bool,
+    /// When true (default), every response carries an `X-Tcp` header describing
+    /// the client TCP connection: peer/local address, connection age, and on
+    /// Linux live kernel `TCP_INFO` stats (RTT, cwnd, MSS, retransmits, ...).
+    /// Disable with `PROXY_TCP_HEADER=false`.
+    pub tcp_header: bool,
 }
 
 /// Error returned when required configuration is missing.
@@ -501,6 +511,13 @@ impl Config {
             .and_then(|s| s.parse::<usize>().ok())
             .filter(|&v| v > 0);
 
+        // Timing/TCP introspection headers are enabled by default; disable
+        // explicitly with PROXY_SERVER_TIMING=false / PROXY_TCP_HEADER=false.
+        let server_timing =
+            !matches!(env::var("PROXY_SERVER_TIMING").as_deref(), Ok("false") | Ok("0"));
+        let tcp_header =
+            !matches!(env::var("PROXY_TCP_HEADER").as_deref(), Ok("false") | Ok("0"));
+
         let path_rate_limits = env_nonempty("PROXY_PATH_RATE_LIMITS")
             .map(|s| {
                 s.split(',')
@@ -587,6 +604,8 @@ impl Config {
             compression,
             pow_difficulty_attack,
             path_rate_limits,
+            server_timing,
+            tcp_header,
         })
     }
 
@@ -687,6 +706,8 @@ impl Config {
             compression: false,
             pow_difficulty_attack: None,
             path_rate_limits: Vec::new(),
+            server_timing: true,
+            tcp_header: true,
         })
     }
 }

@@ -50,6 +50,40 @@ pub struct ReqCtx {
     pub is_tls: bool,
     /// Inbound client remote address (host:port or host).
     pub remote_addr: String,
+    /// When the request entered the service (start of routing/WAF processing).
+    pub start: std::time::Instant,
+    /// Connection-scoped metadata (proxy-side address, accept time, socket fd)
+    /// backing the `X-Tcp` header and the `tls` Server-Timing component.
+    pub conn: Option<Arc<crate::conninfo::ConnInfo>>,
+}
+
+impl ReqCtx {
+    pub fn new(
+        is_tls: bool,
+        remote_addr: String,
+        conn: Option<Arc<crate::conninfo::ConnInfo>>,
+    ) -> Self {
+        ReqCtx {
+            is_tls,
+            remote_addr,
+            start: std::time::Instant::now(),
+            conn,
+        }
+    }
+}
+
+/// Per-request timing breakdown filled in by `handle_inner` and rendered as
+/// the proxy's `Server-Timing` components.
+#[derive(Default)]
+struct Timing {
+    /// Disk-cache lookup.
+    cache_lookup: Option<Duration>,
+    /// Backend time to first response headers (includes retries).
+    backend: Option<Duration>,
+    /// Reading the upstream response body (buffered HTML/cacheable path).
+    body: Option<Duration>,
+    /// Response modification (header rewrite, JS injection, compression).
+    process: Option<Duration>,
 }
 
 /// Cached outcome of a backend health probe (clonable so it can be stored).
@@ -231,7 +265,10 @@ impl Proxy {
             None
         };
 
-        let mut resp = self.handle_inner(req, ctx).await;
+        // Time spent before the proxy: routing + the whole WAF pipeline.
+        let waf_time = ctx.start.elapsed();
+        let mut timing = Timing::default();
+        let mut resp = self.handle_inner(req, ctx, &mut timing).await;
 
         if let Some(id) = req_id {
             if let Ok(hv) = HeaderValue::from_str(&id) {
@@ -239,12 +276,31 @@ impl Proxy {
                     .insert(HeaderName::from_static("x-request-id"), hv);
             }
         }
+
+        if self.cfg.server_timing && resp.status() != StatusCode::SWITCHING_PROTOCOLS {
+            let cache_desc = resp
+                .headers()
+                .get("x-ddos-proxy-cache")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            let value = server_timing_value(waf_time, &timing, cache_desc.as_deref());
+            if let Ok(hv) = HeaderValue::from_str(&value) {
+                // Append: a backend-supplied Server-Timing must survive.
+                resp.headers_mut()
+                    .append(HeaderName::from_static("server-timing"), hv);
+            }
+        }
         resp
     }
 
     /// Forwards `req` to the backend, applying the same header manipulation,
     /// JS injection and caching behaviour as the Go proxy.
-    async fn handle_inner(&self, req: Request<Incoming>, ctx: &ReqCtx) -> Response<BoxedBody> {
+    async fn handle_inner(
+        &self,
+        req: Request<Incoming>,
+        ctx: &ReqCtx,
+        timing: &mut Timing,
+    ) -> Response<BoxedBody> {
         if is_websocket_upgrade(&req) {
             return self.handle_websocket(req, ctx).await;
         }
@@ -265,7 +321,10 @@ impl Proxy {
 
         // Cache hit fast-path.
         if let (Some(cache), Some(key)) = (self.cache.as_ref(), cache_key.as_ref()) {
-            if let Some(stored) = cache.get_fresh(key) {
+            let lookup_start = std::time::Instant::now();
+            let stored = cache.get_fresh(key);
+            timing.cache_lookup = Some(lookup_start.elapsed());
+            if let Some(stored) = stored {
                 if self.cfg.prometheus_enabled {
                     crate::metrics::cache_result("hit");
                 }
@@ -274,9 +333,12 @@ impl Proxy {
                     host: String::new(),
                     accept_gzip,
                 };
-                return self
+                let process_start = std::time::Instant::now();
+                let resp = self
                     .modify_response_buffered(resp, &meta, ctx, CacheStatus::Hit)
                     .await;
+                timing.process = Some(process_start.elapsed());
+                return resp;
             }
             if self.cfg.prometheus_enabled {
                 crate::metrics::cache_result("miss");
@@ -329,6 +391,7 @@ impl Proxy {
             };
             match upstream_result {
                 Err(_) => {
+                    timing.backend = Some(req_start.elapsed());
                     tracing::error!(
                         timeout_secs = self.cfg.backend_timeout.as_secs(),
                         "Backend request timed out"
@@ -355,6 +418,7 @@ impl Proxy {
                             continue;
                         }
                     }
+                    timing.backend = Some(req_start.elapsed());
                     tracing::error!(error = %e, "Proxy error");
                     self.cb_record_failure();
                     if self.cfg.prometheus_enabled {
@@ -368,6 +432,7 @@ impl Proxy {
                 }
                 Ok(Ok(r)) => {
                     self.cb_record_success();
+                    timing.backend = Some(req_start.elapsed());
                     break r;
                 }
             }
@@ -405,13 +470,16 @@ impl Proxy {
 
         if is_html || storable {
             // Buffer the body.
+            let body_start = std::time::Instant::now();
             let collected = match body.collect().await {
                 Ok(c) => c.to_bytes(),
                 Err(e) => {
+                    timing.body = Some(body_start.elapsed());
                     tracing::error!(error = %e, "Proxy error reading body");
                     return error_response(StatusCode::BAD_GATEWAY, "Bad Gateway");
                 }
             };
+            timing.body = Some(body_start.elapsed());
 
             // Store raw (pre-modify) upstream response in the cache.
             if storable {
@@ -429,8 +497,12 @@ impl Proxy {
             } else {
                 CacheStatus::Disabled
             };
-            self.modify_response_buffered(resp, &inbound_meta, ctx, cache_status)
-                .await
+            let process_start = std::time::Instant::now();
+            let resp = self
+                .modify_response_buffered(resp, &inbound_meta, ctx, cache_status)
+                .await;
+            timing.process = Some(process_start.elapsed());
+            resp
         } else {
             // Stream straight through, only adjusting headers.
             let resp = Response::from_parts(parts, body.map_err(|e| Box::new(e) as _).boxed());
@@ -439,7 +511,10 @@ impl Proxy {
             } else {
                 CacheStatus::Disabled
             };
-            self.modify_response_stream(resp, &inbound_meta, ctx, cache_status)
+            let process_start = std::time::Instant::now();
+            let resp = self.modify_response_stream(resp, &inbound_meta, ctx, cache_status);
+            timing.process = Some(process_start.elapsed());
+            resp
         }
     }
 
@@ -1053,6 +1128,31 @@ fn compressible_content_type(ct: &str) -> bool {
         || ct.starts_with("application/javascript")
         || ct.starts_with("application/xml")
         || ct.starts_with("image/svg")
+}
+
+/// Render the proxy's `Server-Timing` components (durations in milliseconds).
+/// The server in `lib.rs` appends the request-level `tls`/`total` components.
+fn server_timing_value(waf: Duration, t: &Timing, cache_desc: Option<&str>) -> String {
+    fn ms(d: Duration) -> f64 {
+        d.as_secs_f64() * 1000.0
+    }
+    let mut parts = vec![format!("waf;dur={:.2}", ms(waf))];
+    if let Some(d) = t.cache_lookup {
+        match cache_desc {
+            Some(desc) => parts.push(format!("cache;desc=\"{desc}\";dur={:.2}", ms(d))),
+            None => parts.push(format!("cache;dur={:.2}", ms(d))),
+        }
+    }
+    if let Some(d) = t.backend {
+        parts.push(format!("backend;desc=\"ttfb\";dur={:.2}", ms(d)));
+    }
+    if let Some(d) = t.body {
+        parts.push(format!("body;desc=\"read\";dur={:.2}", ms(d)));
+    }
+    if let Some(d) = t.process {
+        parts.push(format!("proc;desc=\"modify\";dur={:.2}", ms(d)));
+    }
+    parts.join(", ")
 }
 
 /// Random 16-byte hex request ID.
