@@ -197,24 +197,63 @@ A spoofed TCP SYN flood can't be distinguished from legitimate connection setup
 by rate alone — the attacker sprays random source IPs, each below any per-IP cap.
 When `PROXY_XDP_SYN_AUTH=true` the XDP program adds a stateless **RST-cookie**
 challenge that engages automatically once the aggregate SYN rate crosses
-`PROXY_XDP_SYN_AUTH_PPS`:
+`PROXY_XDP_SYN_AUTH_PPS`.
+
+**Challenge handshake**
 
 1. A new SYN is answered (via `XDP_TX`) with a SYN-ACK whose acknowledgment field
    carries a cookie derived from the 4-tuple and a per-process secret.
 2. A genuine client's TCP stack rejects the unacceptable ACK and replies with a
    `RST` whose sequence number equals the cookie (RFC 793 SYN-SENT behaviour).
 3. Seeing that RST proves the source completed a round-trip (not spoofed), so its
-   IP is whitelisted; the client's SYN retransmit then passes through to the
-   kernel and the real handshake proceeds. Spoofed sources never send the RST and
-   are never whitelisted.
+   IP is whitelisted in a kernel-side map; the client's SYN retransmit then passes
+   through to the kernel and the real handshake proceeds normally. Spoofed sources
+   never send the RST and are never admitted.
 
-Counters are exported as `ddos_proxy_xdp_syn_auth_total{event="challenged"|"validated"}`.
+**When does it engage?**
 
-Caveats: the challenge adds roughly one TCP retransmit timeout (~1 s) of setup
-latency for real clients while a flood is active; whitelisting is per source IP,
-so all clients behind a shared NAT are admitted together once one of them passes;
-and the cookie is encoded in the ACK field with TCP options left intact on the
-reply, since a SYN-SENT socket rejects the segment before they are processed.
+The XDP program maintains a global SYN counter that resets every second. The
+challenge is **inactive** by default; it latches on once the counter crosses
+`PROXY_XDP_SYN_AUTH_PPS` in the current window:
+
+```
+second 0:  1,500 SYN/s  → not engaged, per-source rate limiting only
+second 1:  3,000 SYN/s  → latches ON at packet #2001, cookies issued for rest of window
+second 2:  3,000 SYN/s  → latches ON again almost immediately (window resets each second)
+second 3:    200 SYN/s  → not engaged (flood stopped), back to per-source rate limiting
+```
+
+The latch resets to zero at the start of each 1-second window — there is no
+sticky cooldown. During a sustained flood the threshold is crossed again within
+the first few packets of each new window, so challenging resumes instantly. Once
+the flood stops, the very next window starts clean and real clients are no longer
+challenged.
+
+Below the threshold, the existing **per-source SYN rate limiter** still applies
+(100 SYN/s per IP, configurable via `SYN_MAX_PER_SEC` in the eBPF source).
+
+**Metrics and observability**
+
+Counters are exported via Prometheus:
+
+| Metric | Meaning |
+|--------|---------|
+| `ddos_proxy_xdp_syn_auth_total{event="challenged"}` | SYN-ACK challenges emitted (XDP_TX) |
+| `ddos_proxy_xdp_syn_auth_total{event="validated"}` | RST cookies verified → source whitelisted |
+| `ddos_proxy_xdp_drops_total{reason="syn_flood"}` | SYNs dropped by the per-source rate limiter |
+
+The ratio `validated / challenged` shows what fraction of challenged sources were
+real clients versus spoofed flood traffic.
+
+**Caveats**
+
+- Real clients see roughly one TCP retransmit timeout (~1 s) of extra setup
+  latency while a flood is active (the SYN must be retransmitted after the RST
+  exchange).
+- Whitelisting is per source IP; clients behind a shared NAT are all admitted once
+  any one of them passes the challenge.
+- The cookie is stateless (no per-connection state in the kernel), so the program
+  scales to millions of spoofed sources with no memory growth.
 
 ## Discord DDoS Alerts
 
