@@ -281,6 +281,8 @@ fn config_json(manager: &Manager) -> String {
         "security_headers": c.security_headers,
         "compression": c.compression,
         "request_id": c.request_id,
+        "server_timing": c.server_timing,
+        "tcp_header": c.tcp_header,
         "access_log": c.access_log,
         "cors_origin": c.cors_origin,
         "add_headers": c.add_headers,
@@ -682,6 +684,8 @@ mod tests {
             compression: false,
             pow_difficulty_attack: None,
             path_rate_limits: vec![],
+            server_timing: true,
+            tcp_header: true,
         });
         let rl = Arc::new(RateLimiter::new());
         let target: http::Uri = "http://127.0.0.1:8081".parse().unwrap();

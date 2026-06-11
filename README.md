@@ -25,6 +25,7 @@ This is a Rust implementation of a DDoS protection proxy.
 - **Backend Timeout**: Bounded time-to-first-byte for the backend hop (`PROXY_BACKEND_TIMEOUT`) so a hung origin returns `504` instead of pinning connections open.
 - **Security Headers**: Optional injection of standard security headers, including HSTS on TLS (`PROXY_SECURITY_HEADERS`).
 - **Access Logging**: Optional structured JSON access log for every request (`PROXY_ACCESS_LOG`).
+- **Timing & TCP Introspection Headers**: Every response carries a `Server-Timing` header with the proxy's internal timing breakdown (WAF, cache, backend TTFB, body read, response modify, TLS handshake, total) and an `X-Tcp` header with live client-connection details (addresses, age, and on Linux kernel `TCP_INFO`: RTT, cwnd, MSS, retransmits, ...). Disable with `PROXY_SERVER_TIMING=false` / `PROXY_TCP_HEADER=false`.
 - **Maintenance Mode**: Toggle a `503` maintenance page for all traffic from the admin dashboard or via `POST`/`DELETE /ddos-proxy/admin/maintenance`; `/metrics`, `/healthz`, the admin API, and trusted IPs stay reachable.
 - **Request Hygiene & WAF Rules**: blocked path prefixes, a regex rule over path+query, Host allowlist, required User-Agent, URI-length cap — all matched against a normalized path so `..`/`//` tricks don't bypass them.
 - **Honeypot Paths & Scanner Auto-Block**: instantly block clients touching trap paths, and block IPs that rack up backend 404s probing for exploitable files.
@@ -116,6 +117,8 @@ The proxy is configured via environment variables.
 | `PROXY_CB_COOLDOWN` | `30s` | How long the circuit stays open after tripping. |
 | `PROXY_SERVE_STALE` | `false` | If `true` (with `PROXY_CACHE_ENABLED`), an expired cached copy is served when the backend errors, times out, returns 5xx, or the circuit is open. Marked `X-Ddos-Proxy-Cache: STALE`. |
 | `PROXY_REQUEST_ID` | `false` | If `true`, an `X-Request-Id` is generated (or a valid inbound one kept), forwarded to the backend and returned on the response. |
+| `PROXY_SERVER_TIMING` | `true` | If `true`, every response carries a `Server-Timing` header with the proxy's timing breakdown in milliseconds: `waf`, `cache` (with HIT/MISS/... desc), `backend` (TTFB), `body` (upstream body read), `proc` (response modify), `tls` (handshake, TLS only) and `total`. Backend-supplied `Server-Timing` values are preserved. |
+| `PROXY_TCP_HEADER` | `true` | If `true`, every response carries an `X-Tcp` header describing the client's TCP connection: peer/local address, connection age, and on Linux live kernel `TCP_INFO` stats — state, RTT/RTO, cwnd/ssthresh, MSS/PMTU, window scaling, SACK/timestamps/ECN options, retransmit/loss/reordering counters. |
 | `PROXY_ADD_HEADERS` | `""` | Custom response headers, `Name=Value;Name2=Value2`. Overwrite backend values. |
 | `PROXY_REMOVE_HEADERS` | `""` | Comma-separated response headers to strip (e.g. `X-Powered-By`). |
 | `PROXY_CORS_ORIGIN` | `""` (off) | Adds `Access-Control-Allow-Origin` (plus `-Methods`/`-Headers`) to responses unless the backend set them. |

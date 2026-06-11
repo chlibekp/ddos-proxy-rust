@@ -308,6 +308,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "instant-acme",
+ "libc",
  "minijinja",
  "once_cell",
  "prometheus",

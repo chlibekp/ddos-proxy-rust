@@ -5,6 +5,7 @@ pub mod admin;
 pub mod body;
 pub mod cache;
 pub mod config;
+pub mod conninfo;
 pub mod discord;
 pub mod health;
 pub mod limiter;
@@ -36,34 +37,68 @@ pub async fn route(
     manager: Arc<Manager>,
     ip_limiter: Option<Arc<IPLimiter>>,
 ) -> Result<Response<BoxedBody>, Infallible> {
-    if !manager.config().access_log {
-        return Ok(dispatch(req, ctx, manager, ip_limiter).await);
+    let cfg = manager.config().clone();
+    let start = ctx.start;
+    let conn = ctx.conn.clone();
+    let remote_addr = ctx.remote_addr.clone();
+
+    let access_meta = cfg.access_log.then(|| {
+        let method = req.method().to_string();
+        let path = req
+            .uri()
+            .path_and_query()
+            .map(|p| p.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string());
+        let ip = remote_addr
+            .rsplit_once(':')
+            .map(|(h, _)| h.trim_matches(|c| c == '[' || c == ']').to_string())
+            .unwrap_or_else(|| remote_addr.clone());
+        (method, path, ip)
+    });
+
+    let mut resp = dispatch(req, ctx, manager, ip_limiter).await;
+
+    if resp.status() != StatusCode::SWITCHING_PROTOCOLS {
+        if cfg.server_timing {
+            // Request-level components; the proxy contributes its own detailed
+            // Server-Timing header (waf/cache/backend/body/proc) — multiple
+            // Server-Timing headers are merged by clients per the spec.
+            let mut value = String::new();
+            if let Some(hs) = conn.as_ref().and_then(|c| c.tls_handshake) {
+                value.push_str(&format!(
+                    "tls;desc=\"handshake\";dur={:.2}, ",
+                    hs.as_secs_f64() * 1000.0
+                ));
+            }
+            value.push_str(&format!(
+                "total;dur={:.2}",
+                start.elapsed().as_secs_f64() * 1000.0
+            ));
+            if let Ok(hv) = http::HeaderValue::from_str(&value) {
+                resp.headers_mut()
+                    .append(http::header::HeaderName::from_static("server-timing"), hv);
+            }
+        }
+        if cfg.tcp_header {
+            let value = conninfo::x_tcp_value(conn.as_deref(), &remote_addr);
+            if let Ok(hv) = http::HeaderValue::from_str(&value) {
+                resp.headers_mut()
+                    .insert(http::header::HeaderName::from_static("x-tcp"), hv);
+            }
+        }
     }
 
-    let start = std::time::Instant::now();
-    let method = req.method().to_string();
-    let path = req
-        .uri()
-        .path_and_query()
-        .map(|p| p.as_str().to_string())
-        .unwrap_or_else(|| "/".to_string());
-    let ip = ctx
-        .remote_addr
-        .rsplit_once(':')
-        .map(|(h, _)| h.trim_matches(|c| c == '[' || c == ']').to_string())
-        .unwrap_or_else(|| ctx.remote_addr.clone());
-
-    let resp = dispatch(req, ctx, manager, ip_limiter).await;
-
-    tracing::info!(
-        target: "access",
-        method = %method,
-        path = %path,
-        status = resp.status().as_u16(),
-        duration_ms = start.elapsed().as_millis() as u64,
-        ip = %ip,
-        "request",
-    );
+    if let Some((method, path, ip)) = access_meta {
+        tracing::info!(
+            target: "access",
+            method = %method,
+            path = %path,
+            status = resp.status().as_u16(),
+            duration_ms = start.elapsed().as_millis() as u64,
+            ip = %ip,
+            "request",
+        );
+    }
     Ok(resp)
 }
 

@@ -166,7 +166,7 @@ fn make_waf(backend: SocketAddr, overrides: TestCfgOverride) -> Arc<Manager> {
 
 /// Synthetic `ReqCtx` for tests: plain HTTP, loopback client.
 fn ctx() -> ReqCtx {
-    ReqCtx { is_tls: false, remote_addr: "127.0.0.1:12345".to_string() }
+    ReqCtx::new(false, "127.0.0.1:12345".to_string(), None)
 }
 
 // ── Request-sending harness ──────────────────────────────────────────────────
