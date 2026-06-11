@@ -20,10 +20,6 @@
 #define bpf_htons(x) ((__u16)(__builtin_constant_p(x) ? \
     (((__u16)(x) & 0xffU) << 8) | (((__u16)(x) & 0xff00U) >> 8) : \
     __builtin_bswap16(x)))
-// build.rs compiles with `-target bpfel` (little-endian), so host<->network
-// 32-bit conversions are an unconditional byte swap.
-#define bpf_htonl(x) (__builtin_bswap32(x))
-#define bpf_ntohl(x) (__builtin_bswap32(x))
 
 static void *(*bpf_map_lookup_elem)(void *map, const void *key) = (void *) 1;
 static long (*bpf_map_update_elem)(void *map, const void *key, const void *value, __u64 flags) = (void *) 2;
@@ -71,8 +67,6 @@ struct stats {
     __u64 drop_fragment;       // IP fragmentation (MF or non-zero offset)
     __u64 drop_amplify;        // UDP from known reflection/amplification source ports
     __u64 drop_syn_flood;      // SYN rate-limit exceeded for this source IP
-    __u64 syn_challenged;      // RST-cookie SYN-ACK challenges emitted (XDP_TX)
-    __u64 syn_validated;       // RST cookies validated -> source IP whitelisted
 };
 
 struct {
@@ -112,58 +106,6 @@ struct {
 
 #define SYN_WINDOW_NS    1000000000ULL  // 1 second in nanoseconds
 #define SYN_MAX_PER_SEC  100            // SYN/s per IP before dropping
-
-// ── SYN-cookie (RST-cookie) authentication ────────────────────────────────────
-// Under a TCP SYN flood we can't tell spoofed SYNs from real ones by rate alone
-// (spoofers spray random source IPs, each below the per-IP cap). Instead we
-// answer each new SYN with a deliberately invalid SYN-ACK and watch for the
-// RST a genuine TCP stack sends back (RFC 793: a SYN-SENT socket that receives
-// an unacceptable ACK replies `<SEQ=SEG.ACK><CTL=RST>`). The cookie is encoded
-// in that ACK field, so a returning RST whose sequence matches the cookie
-// proves the source completed a round-trip and is not spoofed — we whitelist it
-// and its retransmitted SYN then passes through to the kernel. Spoofed sources
-// never send the RST, so they never get whitelisted.
-
-// Runtime configuration, populated by userspace (xdp.rs) at load time.
-// IMPORTANT: field order/size must stay byte-identical to BpfConfig in xdp.rs.
-struct xdp_config {
-    __u32 syn_auth_enabled;   // master switch (PROXY_XDP_SYN_AUTH)
-    __u32 syn_auth_pps;       // global SYN/s threshold that engages challenging
-    __u32 cookie_secret;      // random per-process secret for cookie hashing
-    __u32 _pad;
-};
-
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
-    __type(value, struct xdp_config);
-} xdp_cfg SEC(".maps");
-
-// Source IPs that have passed the RST-cookie challenge. LRU so a flood of
-// distinct spoofed sources (which never get inserted) can't starve it anyway.
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 131072);
-    __type(key, __u32);             // src_ip
-    __type(value, __u8);
-} syn_authed SEC(".maps");
-
-// Global pure-SYN counter over a 1-second window. Cookie challenging only
-// engages once the aggregate SYN rate crosses syn_auth_pps, so normal traffic
-// is untouched. `engaged` latches for the remainder of the window (hysteresis).
-struct syn_global {
-    __u64 count;
-    __u64 window_start_ns;
-    __u64 engaged;
-};
-
-struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 1);
-    __type(key, __u32);
-    __type(value, struct syn_global);
-} syn_global_rate SEC(".maps");
 
 // ── Attack-payload fingerprinting map ────────────────────────────────────────
 // FNV-1a hash of the first FP_SAMPLE_LEN bytes of a dropped payload → count
@@ -341,129 +283,12 @@ static __always_inline int is_tls_client_hello(unsigned char *payload, void *dat
     return 1;
 }
 
-// ── SYN-cookie helpers ────────────────────────────────────────────────────────
-
-// Stateless cookie: FNV-1a over the 4-tuple mixed with the per-process secret.
-// Computed identically for the outgoing challenge and the returning RST (both
-// use the client-orientation tuple), so no per-connection state is needed.
-static __always_inline __u32 syn_cookie(__u32 sip, __u32 dip, __u16 sport, __u16 dport, __u32 secret) {
-    __u32 h = 2166136261u ^ secret;
-    h = (h ^ sip) * 16777619u;
-    h = (h ^ dip) * 16777619u;
-    h = (h ^ (((__u32)sport << 16) | (__u32)dport)) * 16777619u;
-    h ^= h >> 13;
-    return h;
-}
-
-static __always_inline __u32 csum_fold(__u32 sum) {
-    sum = (sum & 0xffff) + (sum >> 16);
-    sum = (sum & 0xffff) + (sum >> 16);
-    return sum;
-}
-
-// Sum 16-bit words from `start` for `len` bytes (bounded by data_end). Words are
-// read raw (network order); computing and storing the checksum consistently in
-// that order is endian-neutral by the internet-checksum property.
-static __always_inline __u32 csum_add_words(__u32 sum, void *start, __u32 len, void *data_end) {
-    unsigned char *p = start;
-#pragma unroll
-    for (int i = 0; i < 60; i += 2) {
-        if ((__u32)(i + 2) > len) break;
-        if ((void *)(p + i + 2) > data_end) break;
-        sum += *(__u16 *)(p + i);
-    }
-    return sum;
-}
-
-// Global SYN-rate accounting. Increments the per-second counter and returns 1
-// once the aggregate SYN/s has crossed the configured threshold this window.
-static __always_inline int syn_auth_engaged(struct xdp_config *cfg) {
-    __u32 k = 0;
-    struct syn_global *g = bpf_map_lookup_elem(&syn_global_rate, &k);
-    if (!g) return 0;
-
-    __u64 now = bpf_ktime_get_ns();
-    if (now - g->window_start_ns >= SYN_WINDOW_NS) {
-        g->window_start_ns = now;
-        g->count = 0;
-        g->engaged = 0;
-    }
-    g->count++;
-    if (cfg->syn_auth_pps && g->count >= (__u64)cfg->syn_auth_pps)
-        g->engaged = 1;
-    return g->engaged ? 1 : 0;
-}
-
-// Rewrite the incoming SYN in place into a bogus SYN-ACK challenge and TX it
-// back to the source. The cookie is placed in the ACK field; a genuine client
-// RSTs with that value as its sequence number (see syn_authed above). Returns
-// XDP_TX on success. TCP options from the original SYN are left in place — a
-// SYN-SENT socket rejects the unacceptable ACK (or the stale timestamp echo)
-// with a RST before they matter, so stripping them is unnecessary.
-static __always_inline int send_rst_cookie(struct ethhdr *eth, struct iphdr *ip, struct tcphdr *tcp,
-                                           __u32 secret, void *data_end) {
-    // Re-establish packet bounds inside this frame so the verifier accepts the
-    // in-place writes below (the caller's checks don't carry across the call).
-    // These can't actually fail — the caller already validated each header.
-    if ((void *)(eth + 1) > data_end) return XDP_PASS;
-    if ((void *)(ip + 1) > data_end) return XDP_PASS;
-    if ((void *)(tcp + 1) > data_end) return XDP_PASS;
-
-    __u32 ihl_len = (__u32)ip->ihl * 4;
-    __u32 tcp_hdr_len = (__u32)tcp->doff * 4;
-    __u32 c_sip = ip->saddr, c_dip = ip->daddr;
-    __u16 c_sport = tcp->source, c_dport = tcp->dest;
-    __u32 cookie = syn_cookie(c_sip, c_dip, c_sport, c_dport, secret);
-
-    // L2: swap MACs so the frame heads back toward the source.
-    unsigned char mac[6];
-    __builtin_memcpy(mac, eth->h_source, 6);
-    __builtin_memcpy(eth->h_source, eth->h_dest, 6);
-    __builtin_memcpy(eth->h_dest, mac, 6);
-
-    // L3: swap addresses, refresh TTL.
-    ip->saddr = c_dip;
-    ip->daddr = c_sip;
-    ip->ttl = 64;
-
-    // L4: SYN-ACK carrying the cookie in seq and ack.
-    tcp->source = c_dport;
-    tcp->dest = c_sport;
-    tcp->seq = bpf_htonl(cookie);
-    tcp->ack_seq = bpf_htonl(cookie);
-    tcp->fin = 0; tcp->syn = 1; tcp->rst = 0; tcp->psh = 0;
-    tcp->ack = 1; tcp->urg = 0; tcp->ece = 0; tcp->cwr = 0;
-    tcp->window = bpf_htons(0);
-    tcp->urg_ptr = 0;
-
-    // Recompute IP checksum over the (fixed-length) header.
-    ip->check = 0;
-    ip->check = (__u16)~csum_fold(csum_add_words(0, ip, ihl_len, data_end));
-
-    // Recompute TCP checksum: pseudo-header + TCP header (no payload on a SYN).
-    tcp->check = 0;
-    __u32 sum = 0;
-    sum += *(__u16 *)&ip->saddr;
-    sum += *((__u16 *)&ip->saddr + 1);
-    sum += *(__u16 *)&ip->daddr;
-    sum += *((__u16 *)&ip->daddr + 1);
-    sum += bpf_htons(IPPROTO_TCP);
-    sum += bpf_htons((__u16)tcp_hdr_len);
-    sum = csum_add_words(sum, tcp, tcp_hdr_len, data_end);
-    tcp->check = (__u16)~csum_fold(sum);
-
-    return XDP_TX;
-}
-
 // ── Main XDP program ──────────────────────────────────────────────────────────
 
 SEC("xdp")
 int xdp_drop_func(struct xdp_md *ctx) {
     __u32 stats_key = 0;
     struct stats *st = bpf_map_lookup_elem(&xdp_stats, &stats_key);
-
-    __u32 cfg_key = 0;
-    struct xdp_config *cfg = bpf_map_lookup_elem(&xdp_cfg, &cfg_key);
 
     void *data_end = (void *)(long)ctx->data_end;
     void *data     = (void *)(long)ctx->data;
@@ -608,37 +433,11 @@ int xdp_drop_func(struct xdp_md *ctx) {
         return XDP_PASS;
     }
 
-    // RST-cookie validation: a challenged client answers our bogus SYN-ACK with
-    // a RST whose sequence number equals the cookie. Seeing it proves the source
-    // is genuine (completed a round-trip) — whitelist it and consume the RST.
-    // Gated only by the master switch, not the attack window, since the RST may
-    // arrive just after the SYN rate dips back below threshold.
-    if (cfg && cfg->syn_auth_enabled && tcp->rst && !tcp->syn) {
-        __u32 cookie = syn_cookie(ip->saddr, ip->daddr, tcp->source, tcp->dest, cfg->cookie_secret);
-        if (bpf_ntohl(tcp->seq) == cookie) {
-            __u8 one = 1;
-            bpf_map_update_elem(&syn_authed, &src_ip, &one, BPF_ANY);
-            if (st) __sync_fetch_and_add(&st->syn_validated, 1);
-            return XDP_DROP;
-        }
-    }
-
     // No payload: SYN (new connection), ACK, keepalive, etc.
     if ((void *)payload == data_end) {
-        // Pure SYN (SYN without ACK = connection initiation). SYN+ACK comes from
-        // the server side, not from clients.
+        // Rate-limit pure SYNs (SYN without ACK = connection initiation).
+        // SYN+ACK comes from the server side, not from clients.
         if (tcp->syn && !tcp->ack) {
-            // Under a SYN flood, challenge new sources with an RST cookie instead
-            // of rate-limiting blindly; already-authenticated sources pass through.
-            if (cfg && cfg->syn_auth_enabled && syn_auth_engaged(cfg)) {
-                if (bpf_map_lookup_elem(&syn_authed, &src_ip)) {
-                    count_allowed(st);
-                    return XDP_PASS;
-                }
-                if (st) __sync_fetch_and_add(&st->syn_challenged, 1);
-                return send_rst_cookie(eth, ip, tcp, cfg->cookie_secret, data_end);
-            }
-            // Not under attack (or auth disabled): per-source SYN rate limiting.
             if (check_syn_rate(src_ip, st))
                 return XDP_DROP;
         }

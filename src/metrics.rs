@@ -56,8 +56,6 @@ pub static ALLOWED_REQUESTS: Lazy<IntCounterVec> = Lazy::new(|| {
 ///   dropped_http_invalid — :80 payload that is not a valid HTTP request line
 ///   dropped_tls_invalid  — :443 payload that is not a TLS ClientHello
 ///   dropped_syn_flood    — SYN rate-limit exceeded for this source IP
-///   syn_challenged       — SYN-ACK challenge emitted via XDP_TX (RST-cookie auth)
-///   syn_validated        — returning RST matched the cookie; source whitelisted
 pub static XDP_PACKETS: Lazy<IntCounterVec> = Lazy::new(|| {
     let c = IntCounterVec::new(
         Opts::new(
@@ -369,8 +367,6 @@ pub fn init() {
         "dropped_http_invalid",
         "dropped_tls_invalid",
         "dropped_syn_flood",
-        "syn_challenged",
-        "syn_validated",
     ] {
         XDP_PACKETS.with_label_values(&[action]).inc_by(0);
     }
