@@ -234,16 +234,44 @@ Below the threshold, the existing **per-source SYN rate limiter** still applies
 
 **Metrics and observability**
 
-Counters are exported via Prometheus:
+All XDP packet dispositions are exported as a single unified counter
+`ddos_proxy_xdp_packets_total{action}`. Every packet lands in exactly one bucket,
+so `sum(ddos_proxy_xdp_packets_total)` equals the total packet count.
 
-| Metric | Meaning |
-|--------|---------|
-| `ddos_proxy_xdp_syn_auth_total{event="challenged"}` | SYN-ACK challenges emitted (XDP_TX) |
-| `ddos_proxy_xdp_syn_auth_total{event="validated"}` | RST cookies verified → source whitelisted |
-| `ddos_proxy_xdp_drops_total{reason="syn_flood"}` | SYNs dropped by the per-source rate limiter |
+| `action` label | Meaning |
+|----------------|---------|
+| `passed` | Forwarded to the kernel (XDP_PASS) |
+| `dropped_syn_flood` | SYN rate-limit exceeded for this source IP |
+| `dropped_udp` | UDP flood on service port (80/443) |
+| `dropped_amplify` | UDP from a known reflection/amplification source port |
+| `dropped_icmp` | ICMP echo request flood |
+| `dropped_bad_flags` | NULL / Xmas / SYN+FIN / RST+SYN TCP flag combinations |
+| `dropped_fragment` | IP fragmentation (MF bit or non-zero fragment offset) |
+| `dropped_http_invalid` | :80 payload that is not a valid HTTP request line |
+| `dropped_tls_invalid` | :443 payload that is not a TLS ClientHello |
+| `dropped_tcp_malformed` | Truncated or malformed TCP / invalid IP header length |
+| `dropped_blocklist` | Source IP on the static blocklist |
+| `syn_challenged` | SYN-ACK challenge emitted via XDP_TX (RST-cookie auth) |
+| `syn_validated` | Returning RST matched the cookie; source IP whitelisted |
 
-The ratio `validated / challenged` shows what fraction of challenged sources were
-real clients versus spoofed flood traffic.
+Useful PromQL:
+
+```promql
+# Total dropped per attack type (rate over last minute)
+rate(ddos_proxy_xdp_packets_total{action=~"dropped_.*"}[1m])
+
+# Total dropped across all types
+sum(rate(ddos_proxy_xdp_packets_total{action=~"dropped_.*"}[1m]))
+
+# RST-cookie auth efficiency (validated / challenged)
+rate(ddos_proxy_xdp_packets_total{action="syn_validated"}[5m])
+  / rate(ddos_proxy_xdp_packets_total{action="syn_challenged"}[5m])
+```
+
+The ratio `syn_validated / syn_challenged` shows what fraction of challenged
+sources were real clients versus spoofed flood traffic. During a pure spoofed
+flood this approaches 0; during a high-rate DDoS from real (rented) bots it will
+be non-zero.
 
 **Caveats**
 
@@ -312,7 +340,7 @@ txt \x90\x00\x90\x00
 
 The fingerprint set is cleared at each all-clear so every attack window starts fresh. A header-only/volumetric flood (e.g. spoofed SYNs with no payload) records no fingerprint, which the alert states explicitly.
 
-**Prometheus** — the per-reason drop breakdown is also exported as `ddos_proxy_xdp_drops_total{reason="…"}` alongside the existing `ddos_proxy_xdp_packets_total`.
+**Prometheus** — attack dispositions are exported as `ddos_proxy_xdp_packets_total{action="dropped_syn_flood"|"dropped_udp"|…}` (see the XDP SYN-cookie section for the full label list and PromQL examples).
 
 ## Security Notes
 
