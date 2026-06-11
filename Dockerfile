@@ -24,10 +24,10 @@ RUN if [ -n "$FEATURES" ]; then \
 # Runtime stage
 FROM debian:bookworm-slim
 
-# ca-certificates for outbound HTTPS (Turnstile verification, ACME, https backends).
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+# CA bundle for outbound HTTPS (Turnstile verification, ACME, https backends).
+# Copied from the builder image instead of apt-get install so the runtime stage
+# builds without network access to the Debian mirrors.
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
 WORKDIR /app
 
