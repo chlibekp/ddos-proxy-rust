@@ -109,6 +109,13 @@ pub struct Config {
     /// Regex matched against the raw path+query; matching requests get 403.
     /// Set via `PROXY_BLOCK_REGEX` (e.g. `(?i)(union\s+select|\.\./\.\./)`).
     pub block_regex: Option<regex::Regex>,
+    /// Regex applied to the raw request body of POST/PUT/PATCH requests;
+    /// matching requests get 403 before reaching the backend.  The body is
+    /// buffered (up to `max_body_size`, default 1 MiB) for inspection.  Use this
+    /// to block SQL-injection payloads, command-injection strings, or other
+    /// patterns that appear in form fields or JSON bodies.
+    /// Set via `PROXY_BLOCK_BODY_REGEX` (e.g. `(?i)(union\s+select|exec\s*\()`).
+    pub block_body_regex: Option<regex::Regex>,
     /// Hostnames the proxy will serve (lowercase, port stripped). Entries may be
     /// exact (`example.com`) or wildcard (`*.example.com`). Empty = all hosts.
     /// Set via `PROXY_ALLOWED_HOSTS`.
@@ -216,6 +223,7 @@ pub struct TestCfgOverride {
     pub cache_enabled: Option<bool>,
     pub serve_stale: Option<bool>,
     pub request_id: Option<bool>,
+    pub block_body_regex: Option<regex::Regex>,
 }
 
 fn env_nonempty(key: &str) -> Option<String> {
@@ -427,6 +435,16 @@ impl Config {
             }
         });
 
+        let block_body_regex = env_nonempty("PROXY_BLOCK_BODY_REGEX").and_then(|s| {
+            match regex::Regex::new(&s) {
+                Ok(re) => Some(re),
+                Err(e) => {
+                    tracing::warn!(error = %e, "Ignoring invalid PROXY_BLOCK_BODY_REGEX");
+                    None
+                }
+            }
+        });
+
         let allowed_hosts = env_nonempty("PROXY_ALLOWED_HOSTS")
             .map(|s| {
                 s.split(',')
@@ -585,6 +603,7 @@ impl Config {
             access_log,
             blocked_paths,
             block_regex,
+            block_body_regex,
             allowed_hosts,
             require_ua,
             max_uri_len,
@@ -682,6 +701,7 @@ impl Config {
             access_log: false,
             blocked_paths: overrides.blocked_paths.unwrap_or_default(),
             block_regex: None,
+            block_body_regex: overrides.block_body_regex,
             allowed_hosts: overrides
                 .allowed_hosts
                 .unwrap_or_default()

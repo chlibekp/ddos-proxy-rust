@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use http::header::{HeaderName, HeaderValue};
 use http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
-use http_body_util::BodyExt;
+use http_body_util::{BodyExt, Limited};
 use hyper::body::Incoming;
 use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::connect::HttpConnector;
@@ -358,7 +358,15 @@ impl Proxy {
         }
 
         // Build the outbound request.
+        // Body-regex inspection and boxing happen here: the body is collected
+        // from Incoming (using Limited<Incoming>, not Limited<BoxedBody>) so the
+        // async state machine in the public `handle()` never holds a BoxedBody,
+        // keeping hyper's `serve_connection_with_upgrades` lifetime constraints satisfied.
         let original_host = host_header(&req).unwrap_or_default();
+        let req = match self.inspect_and_box_body(req).await {
+            Ok(r) => r,
+            Err(resp) => return resp,
+        };
         let outbound = match self.build_outbound(req, ctx, &original_host) {
             Ok(r) => r,
             Err(resp) => return resp,
@@ -529,10 +537,49 @@ impl Proxy {
         format!("{}://{}{}|host={}", self.target_scheme, self.target_host, joined, host)
     }
 
+    /// Inspect the request body for `PROXY_BLOCK_BODY_REGEX` and box it.
+    ///
+    /// Uses `Limited<Incoming>` (the native hyper body type) rather than
+    /// `Limited<BoxedBody>` so the caller's async state machine doesn't hold a
+    /// `Box<dyn Error + 'static>` trait-object across an await point — which
+    /// would trigger an unsatisfiable HRTB constraint in hyper's upgrade machinery.
+    async fn inspect_and_box_body(
+        &self,
+        req: Request<Incoming>,
+    ) -> Result<Request<BoxedBody>, Response<BoxedBody>> {
+        if let Some(re) = &self.cfg.block_body_regex {
+            if matches!(req.method(), &Method::POST | &Method::PUT | &Method::PATCH) {
+                let limit = self.cfg.max_body_size.map(|n| n as usize).unwrap_or(1024 * 1024);
+                let (parts, body) = req.into_parts();
+                return match Limited::new(body, limit).collect().await {
+                    Ok(collected) => {
+                        let bytes = collected.to_bytes();
+                        if re.is_match(&String::from_utf8_lossy(&bytes)) {
+                            if self.cfg.prometheus_enabled {
+                                crate::metrics::dropped("body_regex");
+                            }
+                            Err(error_response(StatusCode::FORBIDDEN, "Forbidden"))
+                        } else {
+                            Ok(Request::from_parts(parts, full(bytes)))
+                        }
+                    }
+                    Err(_) => {
+                        if self.cfg.prometheus_enabled {
+                            crate::metrics::dropped("body_too_large");
+                        }
+                        Err(error_response(StatusCode::PAYLOAD_TOO_LARGE, "Payload Too Large"))
+                    }
+                };
+            }
+        }
+        let (parts, body) = req.into_parts();
+        Ok(Request::from_parts(parts, body.map_err(|e| Box::new(e) as _).boxed()))
+    }
+
     /// Build the outbound request from the inbound one (non-websocket path).
     fn build_outbound(
         &self,
-        req: Request<Incoming>,
+        req: Request<BoxedBody>,
         ctx: &ReqCtx,
         original_host: &str,
     ) -> Result<Request<BoxedBody>, Response<BoxedBody>> {
@@ -606,8 +653,7 @@ impl Proxy {
             );
         }
 
-        let boxed = body.map_err(|e| Box::new(e) as _).boxed();
-        Ok(Request::from_parts(parts, boxed))
+        Ok(Request::from_parts(parts, body))
     }
 
     /// Serve a stale cached copy of `cache_key` if serve-stale is enabled and an
