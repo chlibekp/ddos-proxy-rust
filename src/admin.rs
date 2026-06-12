@@ -665,6 +665,7 @@ mod tests {
             access_log: false,
             blocked_paths: vec![],
             block_regex: None,
+            block_body_regex: None,
             allowed_hosts: vec![],
             require_ua: false,
             max_uri_len: None,

@@ -45,6 +45,7 @@
 /// | 32| waf         | Exempt path bypasses challenge even in always-on             |
 /// | 33| waf         | Host allowlist: unknown host blocked, allowed host passes    |
 /// | 34| proxy       | X-Ddos-Proxy-Cache: DYNAMIC for non-cacheable response       |
+/// | 35| proxy       | PROXY_BLOCK_BODY_REGEX: matching POST body → 403, safe body → 200 |
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -235,6 +236,51 @@ async fn send_request(proxy_addr: SocketAddr, req: Request<()>) -> (Response<()>
     (Response::from_parts(parts, ()), bytes)
 }
 
+async fn send_request_with_body(
+    proxy_addr: SocketAddr,
+    req: Request<()>,
+    body: &'static [u8],
+) -> (Response<()>, Bytes) {
+    let url: http::Uri = format!("http://{}{}", proxy_addr, req.uri()).parse().unwrap();
+    let (mut parts, _) = req.into_parts();
+    parts.uri = url;
+    let req = Request::from_parts(parts, bfull(body));
+
+    let connector = hyper_util::client::legacy::connect::HttpConnector::new();
+    let client =
+        hyper_util::client::legacy::Client::builder(TokioExecutor::new()).build(connector);
+    let resp = client.request(req).await.expect("test client request failed");
+    let (parts, body) = resp.into_parts();
+    let bytes = body.collect().await.unwrap().to_bytes();
+    (Response::from_parts(parts, ()), bytes)
+}
+
+async fn call_proxy_with_body(
+    proxy: Arc<Proxy>,
+    req: Request<()>,
+    body: &'static [u8],
+) -> (Response<()>, Bytes) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let p = proxy.clone();
+    tokio::spawn(async move {
+        let Ok((stream, _)) = listener.accept().await else { return };
+        let io = TokioIo::new(stream);
+        let c = ctx();
+        let svc = service_fn(move |req: Request<Incoming>| {
+            let p = p.clone();
+            let c = c.clone();
+            async move { Ok::<_, Infallible>(p.handle(req, &c).await) }
+        });
+        let _ = auto::Builder::new(TokioExecutor::new())
+            .serve_connection(io, svc)
+            .await;
+    });
+
+    send_request_with_body(addr, req, body).await
+}
+
 // ── Request builders ─────────────────────────────────────────────────────────
 
 fn get(path: &str) -> Request<()> {
@@ -248,6 +294,16 @@ fn get_h(path: &str, name: &str, value: &str) -> Request<()> {
 fn waf_get(path: &str) -> Request<()> {
     Request::builder()
         .method(Method::GET)
+        .uri(path)
+        .header("host", "example.com")
+        .header("user-agent", "TestAgent/1.0")
+        .body(())
+        .unwrap()
+}
+
+fn waf_post(path: &str) -> Request<()> {
+    Request::builder()
+        .method(Method::POST)
         .uri(path)
         .header("host", "example.com")
         .header("user-agent", "TestAgent/1.0")
@@ -1301,4 +1357,41 @@ async fn test_cache_header_dynamic_for_no_store() {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     assert_eq!(ch, "DYNAMIC");
+}
+
+/// Test 35 – `PROXY_BLOCK_BODY_REGEX`: POST body matching the regex is blocked
+/// with 403 before reaching the backend; a safe body is forwarded normally.
+#[tokio::test]
+async fn test_block_body_regex() {
+    let backend = spawn_backend(|_req| async {
+        Response::builder().status(200).body(bfull("ok")).unwrap()
+    })
+    .await;
+
+    let proxy = make_proxy(
+        backend,
+        TestCfgOverride {
+            block_body_regex: Some(regex::Regex::new(r"(?i)union\s+select").unwrap()),
+            ..Default::default()
+        },
+    );
+
+    // Body containing the SQL-injection pattern (literal spaces) → 403.
+    let (r1, _) = call_proxy_with_body(
+        proxy.clone(),
+        waf_post("/submit"),
+        b"query=UNION SELECT 1,2,3 FROM users",
+    )
+    .await;
+    assert_eq!(r1.status(), 403, "SQL injection body should be blocked");
+
+    // Clean body → forwarded, backend returns 200.
+    let (r2, body2) = call_proxy_with_body(
+        proxy,
+        waf_post("/submit"),
+        b"name=foo&comment=hello+world",
+    )
+    .await;
+    assert_eq!(r2.status(), 200, "safe body should be forwarded");
+    assert_eq!(&body2[..], b"ok");
 }

@@ -303,6 +303,7 @@ dependencies = [
  "futures-util",
  "hex",
  "http",
+ "http-body",
  "http-body-util",
  "hyper",
  "hyper-rustls",
