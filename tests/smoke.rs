@@ -45,6 +45,7 @@
 /// | 32| waf         | Exempt path bypasses challenge even in always-on             |
 /// | 33| waf         | Host allowlist: unknown host blocked, allowed host passes    |
 /// | 34| proxy       | X-Ddos-Proxy-Cache: DYNAMIC for non-cacheable response       |
+/// | 35| waf         | Burst allowance: N requests pass within burst limit, N+1 challenged |
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -1274,6 +1275,45 @@ async fn test_host_allowlist() {
         .unwrap();
     let (r2, _) = call_waf(mgr, req_good).await;
     assert_eq!(r2.status(), 200, "allowed host should be proxied");
+}
+
+/// Test 35 – per-IP burst allowance: a client may make up to `burst` requests
+/// before being challenged, even when each second's sustained rate is lower.
+///
+/// Configuration: `max_req_per_ip = 1, max_req_per_ip_burst = 5`.
+/// The bucket starts full (5 tokens). Each of the first 5 requests drains one
+/// token and is proxied normally. The 6th request finds an empty bucket and
+/// receives the JS challenge (418 I'm a Teapot).
+#[tokio::test]
+async fn test_per_ip_rate_burst_allowance() {
+    let backend = spawn_backend(|_req| async {
+        Response::builder().status(200).body(bfull("ok")).unwrap()
+    })
+    .await;
+
+    let mgr = make_waf(
+        backend,
+        TestCfgOverride {
+            max_req_per_ip: Some(1),
+            max_req_per_ip_burst: Some(5),
+            cookie_challenge: Some(false),
+            ..Default::default()
+        },
+    );
+
+    // All requests within the burst window should be proxied.
+    for i in 0..5usize {
+        let (r, _) = call_waf(mgr.clone(), waf_get("/")).await;
+        assert_eq!(r.status(), 200, "request {i} should succeed within burst limit");
+    }
+
+    // The next request exceeds the bucket capacity and must be challenged.
+    let (r_over, _) = call_waf(mgr.clone(), waf_get("/")).await;
+    assert_eq!(
+        r_over.status(),
+        StatusCode::IM_A_TEAPOT,
+        "request beyond burst limit should receive JS challenge"
+    );
 }
 
 /// Test 34 – `X-Ddos-Proxy-Cache: DYNAMIC` for responses with `no-store`.
