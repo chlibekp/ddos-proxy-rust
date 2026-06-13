@@ -1013,6 +1013,11 @@ impl Manager {
         {
             self.mitigation_until
                 .store(now_s + mitigation_secs, Ordering::SeqCst);
+            // Backend gateway timeouts indicate the server is under load — skip the
+            // cookie-challenge tier and go straight to JS/PoW to shed traffic faster.
+            self.js_challenge_until
+                .store(now_s + mitigation_secs, Ordering::SeqCst);
+            self.mitigation_started_at.store(now_s, Ordering::SeqCst);
             should_serve_challenge = true;
         }
 
@@ -1131,8 +1136,17 @@ impl Manager {
             {
                 let count = self.timeout_count.fetch_add(1, Ordering::SeqCst) + 1;
                 if count >= self.cfg.max_timeouts {
+                    let ts = now_unix();
                     self.mitigation_until
-                        .store(now_unix() + mitigation_secs, Ordering::SeqCst);
+                        .store(ts + mitigation_secs, Ordering::SeqCst);
+                    // Jump straight to JS challenge — backend is clearly overloaded.
+                    self.js_challenge_until
+                        .store(ts + mitigation_secs, Ordering::SeqCst);
+                    self.mitigation_started_at.store(ts, Ordering::SeqCst);
+                    tracing::warn!(
+                        count,
+                        "gateway timeout threshold reached; enabling JS challenge"
+                    );
                 }
             }
             resp
