@@ -11,10 +11,13 @@ pub struct ClientState {
     pub verified_flag: AtomicBool,
     pub verified_until: AtomicI64,  // unix seconds when verification expires
     pub inner: Mutex<Inner>,
-    /// Per-IP rate-limit window: the unix second in which ip_req_count started.
+    /// Per-IP rate-limit window: the unix second of the last token refill.
     pub ip_req_window: AtomicI64,
-    /// Requests counted in the current ip_req_window second.
-    pub ip_req_count: AtomicI64,
+    /// Token bucket for per-IP rate limiting (PROXY_MAX_REQ_PER_IP /
+    /// PROXY_MAX_REQ_PER_IP_BURST). Starts at 0; the first request triggers a
+    /// refill to the burst capacity, then each request consumes one token.
+    /// Negative values mean the bucket is overdrawn.
+    pub ip_tokens: AtomicI64,
     /// Requests from this client currently being proxied (in flight). Used by
     /// the PROXY_MAX_CONCURRENT_PER_IP cap.
     pub inflight: AtomicI64,
@@ -57,7 +60,7 @@ impl Default for ClientState {
             verified_until: AtomicI64::new(0),
             inner: Mutex::new(Inner::default()),
             ip_req_window: AtomicI64::new(0),
-            ip_req_count: AtomicI64::new(0),
+            ip_tokens: AtomicI64::new(0),
             inflight: AtomicI64::new(0),
         }
     }

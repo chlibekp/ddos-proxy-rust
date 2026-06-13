@@ -42,6 +42,13 @@ pub struct Config {
     /// When an unverified IP exceeds this limit it is served the WAF challenge
     /// instead of being proxied, without triggering a global mitigation window.
     pub max_req_per_ip: Option<i64>,
+    /// Maximum burst size for the per-IP token bucket. When set, a client may
+    /// exceed `max_req_per_ip` in a single second as long as it has accumulated
+    /// tokens from previous quiet seconds (up to this cap). Must be ≥
+    /// `max_req_per_ip`; values below are silently raised to `max_req_per_ip`.
+    /// `None` disables burst (bucket capacity equals `max_req_per_ip`).
+    /// Set via `PROXY_MAX_REQ_PER_IP_BURST`.
+    pub max_req_per_ip_burst: Option<i64>,
     /// Bearer token that protects the `/ddos-proxy/admin/` endpoints. `None` disables the admin API.
     pub admin_secret: Option<String>,
 
@@ -211,6 +218,7 @@ pub struct TestCfgOverride {
     pub cookie_challenge: Option<bool>,
     pub pow_difficulty: Option<usize>,
     pub max_req_per_ip: Option<i64>,
+    pub max_req_per_ip_burst: Option<i64>,
     pub max_404_per_ip: Option<i64>,
     pub exempt_paths: Option<Vec<String>>,
     pub cache_enabled: Option<bool>,
@@ -343,6 +351,12 @@ impl Config {
 
         // Per-IP rate cap: 0 or absent disables the feature.
         let max_req_per_ip = env_nonempty("PROXY_MAX_REQ_PER_IP")
+            .and_then(|s| s.parse::<i64>().ok())
+            .filter(|&v| v > 0);
+
+        // Optional burst capacity for the per-IP token bucket. Values below
+        // max_req_per_ip are silently raised at use time; 0 or absent disables.
+        let max_req_per_ip_burst = env_nonempty("PROXY_MAX_REQ_PER_IP_BURST")
             .and_then(|s| s.parse::<i64>().ok())
             .filter(|&v| v > 0);
 
@@ -567,6 +581,7 @@ impl Config {
             max_ip_states,
             cookie_challenge,
             max_req_per_ip,
+            max_req_per_ip_burst,
             admin_secret,
             healthz_enabled,
             healthz_path,
@@ -647,6 +662,7 @@ impl Config {
             max_ip_states: 100_000,
             cookie_challenge: overrides.cookie_challenge.unwrap_or(true),
             max_req_per_ip: overrides.max_req_per_ip,
+            max_req_per_ip_burst: overrides.max_req_per_ip_burst,
             admin_secret: None,
             healthz_enabled: true,
             healthz_path: "/healthz".to_string(),

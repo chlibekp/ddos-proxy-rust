@@ -339,26 +339,46 @@ impl Manager {
         }
     }
 
-    /// Count this request toward the per-IP rate window and return `true` if the
-    /// configured limit is exceeded for the current second.
+    /// Consume one token from the per-IP token bucket and return `true` when the
+    /// bucket is exhausted (i.e. the client is over its rate limit).
     ///
-    /// Uses Relaxed ordering throughout — minor inaccuracies at second boundaries
-    /// are acceptable for rate limiting.
+    /// **Token bucket semantics** — bucket capacity is `max_req_per_ip_burst`
+    /// (or `max_req_per_ip` when no burst is configured). Each elapsed second
+    /// refills `max_req_per_ip` tokens up to the capacity. A client that is idle
+    /// accumulates tokens and can spend them in a short burst; a client that sends
+    /// continuously at or above the sustained rate will drain the bucket and get
+    /// challenged.
+    ///
+    /// Relaxed ordering throughout — minor inaccuracies at second boundaries are
+    /// acceptable for rate limiting (same trade-off as the previous per-second
+    /// counter approach).
     fn check_per_ip_rate(&self, state: &Arc<ClientState>, now_s: i64) -> bool {
         let Some(max) = self.cfg.max_req_per_ip else {
             return false;
         };
-        let window = state.ip_req_window.load(Ordering::Relaxed);
-        let count = if now_s > window {
-            // New second: reset the window. Concurrent resets (race) are harmless —
-            // at worst we lose one or two counts at the boundary, which is fine.
-            state.ip_req_window.store(now_s, Ordering::Relaxed);
-            state.ip_req_count.store(1, Ordering::Relaxed);
-            1
-        } else {
-            state.ip_req_count.fetch_add(1, Ordering::Relaxed) + 1
+        // Burst capacity must be at least as large as the per-second rate;
+        // enforce that silently so misconfigured values don't disable bursting.
+        let burst = match self.cfg.max_req_per_ip_burst {
+            Some(b) if b > max => b,
+            _ => max,
         };
-        count > max
+
+        let window = state.ip_req_window.load(Ordering::Relaxed);
+        if now_s > window {
+            // Refill tokens proportional to elapsed seconds, capped at burst capacity.
+            // For a brand-new state (window = 0) elapsed is enormous, which fills the
+            // bucket to capacity — this is correct: a fresh IP starts with a full burst.
+            // Concurrent refills at a second boundary are harmless; both threads will
+            // saturate at `burst` and differ by at most one token consumed.
+            let elapsed = now_s - window;
+            let current = state.ip_tokens.load(Ordering::Relaxed);
+            let refilled = current.saturating_add(max.saturating_mul(elapsed)).min(burst);
+            state.ip_req_window.store(now_s, Ordering::Relaxed);
+            state.ip_tokens.store(refilled, Ordering::Relaxed);
+        }
+
+        // Consume one token; a negative result means the bucket is overdrawn.
+        state.ip_tokens.fetch_sub(1, Ordering::Relaxed) - 1 < 0
     }
 
     /// Whether `ip` is denied by the static config list or the runtime list.
