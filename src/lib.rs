@@ -2,6 +2,7 @@
 #![recursion_limit = "256"]
 
 pub mod admin;
+pub mod audit;
 pub mod body;
 pub mod cache;
 pub mod config;

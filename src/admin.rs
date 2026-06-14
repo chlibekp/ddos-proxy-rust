@@ -22,6 +22,13 @@ pub async fn handle(req: Request<Incoming>, ctx: ReqCtx, manager: Arc<Manager>) 
     let method = req.method().clone();
     let path = req.uri().path().to_string();
 
+    // Extract the caller's IP (without port) for audit log entries.
+    let operator_ip = ctx
+        .remote_addr
+        .rsplit_once(':')
+        .map(|(h, _)| h.trim_matches(|c| c == '[' || c == ']').to_string())
+        .unwrap_or_else(|| ctx.remote_addr.clone());
+
     // Dashboard page — served without a server-side auth check so the browser
     // can load it; the JS layer handles login and stores the token in sessionStorage.
     // Only served when the admin API is actually enabled.
@@ -91,6 +98,7 @@ pub async fn handle(req: Request<Incoming>, ctx: ReqCtx, manager: Arc<Manager>) 
         ("POST", "/ddos-proxy/admin/block") => match read_block_req(req).await {
             Some((ip, host)) => {
                 manager.manual_block(&ip, &host);
+                manager.record_audit("block", &operator_ip, Some(format!("{ip}|{host}")));
                 json(StatusCode::OK, r#"{"ok":true}"#)
             }
             None => json(
@@ -102,16 +110,19 @@ pub async fn handle(req: Request<Incoming>, ctx: ReqCtx, manager: Arc<Manager>) 
         // Clear every tracked IP state.
         ("DELETE", "/ddos-proxy/admin/states") => {
             let cleared = manager.clear_states();
+            manager.record_audit("states_cleared", &operator_ip, Some(format!("cleared={cleared}")));
             json(StatusCode::OK, &format!(r#"{{"ok":true,"cleared":{cleared}}}"#))
         }
 
         // Force the mitigation window on / off.
         ("POST", "/ddos-proxy/admin/mitigation") => {
             manager.set_mitigation(true);
+            manager.record_audit("mitigation_on", &operator_ip, None);
             json(StatusCode::OK, r#"{"ok":true,"mitigation":true}"#)
         }
         ("DELETE", "/ddos-proxy/admin/mitigation") => {
             manager.set_mitigation(false);
+            manager.record_audit("mitigation_off", &operator_ip, None);
             json(StatusCode::OK, r#"{"ok":true,"mitigation":false}"#)
         }
 
@@ -136,6 +147,13 @@ pub async fn handle(req: Request<Incoming>, ctx: ReqCtx, manager: Arc<Manager>) 
                         manager.remove_dyn_ip(deny, &entry)
                     };
                     if ok {
+                        let list = if deny { "denylist" } else { "trustlist" };
+                        let action = if m == "POST" {
+                            format!("{list}_add")
+                        } else {
+                            format!("{list}_remove")
+                        };
+                        manager.record_audit(&action, &operator_ip, Some(entry));
                         json(StatusCode::OK, r#"{"ok":true}"#)
                     } else {
                         json(
@@ -153,7 +171,10 @@ pub async fn handle(req: Request<Incoming>, ctx: ReqCtx, manager: Arc<Manager>) 
 
         // Wipe the disk cache.
         ("DELETE", "/ddos-proxy/admin/cache") => match manager.purge_cache() {
-            Some(removed) => json(StatusCode::OK, &format!(r#"{{"ok":true,"removed":{removed}}}"#)),
+            Some(removed) => {
+                manager.record_audit("cache_purge", &operator_ip, Some(format!("removed={removed}")));
+                json(StatusCode::OK, &format!(r#"{{"ok":true,"removed":{removed}}}"#))
+            }
             None => json(StatusCode::BAD_REQUEST, r#"{"error":"cache is disabled"}"#),
         },
 
@@ -170,10 +191,12 @@ pub async fn handle(req: Request<Incoming>, ctx: ReqCtx, manager: Arc<Manager>) 
         }
         ("POST", "/ddos-proxy/admin/maintenance") => {
             manager.set_maintenance(true);
+            manager.record_audit("maintenance_on", &operator_ip, None);
             json(StatusCode::OK, r#"{"ok":true,"maintenance":true}"#)
         }
         ("DELETE", "/ddos-proxy/admin/maintenance") => {
             manager.set_maintenance(false);
+            manager.record_audit("maintenance_off", &operator_ip, None);
             json(StatusCode::OK, r#"{"ok":true,"maintenance":false}"#)
         }
 
@@ -181,6 +204,7 @@ pub async fn handle(req: Request<Incoming>, ctx: ReqCtx, manager: Arc<Manager>) 
         ("DELETE", "/ddos-proxy/admin/block") => match read_block_req(req).await {
             Some((ip, host)) => {
                 manager.manual_unblock(&ip, &host);
+                manager.record_audit("unblock", &operator_ip, Some(format!("{ip}|{host}")));
                 json(StatusCode::OK, r#"{"ok":true}"#)
             }
             None => json(
@@ -188,6 +212,13 @@ pub async fn handle(req: Request<Incoming>, ctx: ReqCtx, manager: Arc<Manager>) 
                 r#"{"error":"expected JSON {\"ip\":\"...\",\"host\":\"...\"}"}"#,
             ),
         },
+
+        // Recent admin actions audit log.
+        ("GET", "/ddos-proxy/admin/audit") => {
+            let entries = manager.list_audit();
+            let body = serde_json::to_string(&entries).unwrap_or_else(|_| "[]".to_string());
+            json(StatusCode::OK, &body)
+        }
 
         _ => json(StatusCode::NOT_FOUND, r#"{"error":"not found"}"#),
     }
@@ -376,6 +407,8 @@ tr:hover td{background:#1e293b}
 .toast.show{opacity:1}
 .toast.ok{background:#14532d;color:#86efac}
 .toast.err{background:#7f1d1d;color:#fca5a5}
+.audit-action{font-family:monospace;font-size:12px;background:#0f1117;padding:2px 6px;border-radius:4px;color:#93c5fd}
+.section-sep{margin:28px 0 16px;border-top:1px solid #334155;padding-top:24px}
 </style>
 </head>
 <body>
@@ -441,6 +474,27 @@ tr:hover td{background:#1e293b}
       </thead>
       <tbody id="states-body"></tbody>
     </table>
+  </div>
+
+  <div class="section-sep">
+    <div class="refresh-row">
+      <h2>Audit Log</h2>
+      <span id="audit-count">—</span>
+      <button onclick="refreshAudit()">Refresh</button>
+    </div>
+    <div class="tbl-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Action</th>
+            <th>Operator IP</th>
+            <th>Detail</th>
+          </tr>
+        </thead>
+        <tbody id="audit-body"></tbody>
+      </table>
+    </div>
   </div>
 </div>
 
@@ -541,8 +595,26 @@ async function refresh() {
 
 function startRefresh() {
   refresh();
+  refreshAudit();
   clearInterval(refreshTimer);
-  refreshTimer = setInterval(refresh, 5000);
+  refreshTimer = setInterval(() => { refresh(); refreshAudit(); }, 5000);
+}
+
+async function refreshAudit() {
+  const r = await api('/ddos-proxy/admin/audit').catch(() => null);
+  if (!r || !r.ok) return;
+  const entries = await r.json();
+  const tbody = document.getElementById('audit-body');
+  document.getElementById('audit-count').textContent = entries.length + ' entries';
+  tbody.innerHTML = entries.length === 0
+    ? '<tr><td colspan="4" style="color:#475569;text-align:center;padding:24px">No admin actions recorded yet</td></tr>'
+    : entries.map(e => `
+      <tr>
+        <td style="font-family:monospace;white-space:nowrap">${new Date(e.timestamp_unix * 1000).toLocaleTimeString()}</td>
+        <td><span class="audit-action">${esc(e.action)}</span></td>
+        <td style="font-family:monospace">${esc(e.operator_ip)}</td>
+        <td style="color:#94a3b8">${e.detail ? esc(e.detail) : '—'}</td>
+      </tr>`).join('');
 }
 
 async function blockIP() {
@@ -550,28 +622,28 @@ async function blockIP() {
   const host = document.getElementById('f-host').value.trim();
   if (!ip || !host) { toast('Enter both IP and host', false); return; }
   const r = await api('/ddos-proxy/admin/block', { method: 'POST', body: JSON.stringify({ ip, host }) });
-  if (r.ok) { toast('Blocked ' + ip); refresh(); document.getElementById('f-ip').value = ''; document.getElementById('f-host').value = ''; }
+  if (r.ok) { toast('Blocked ' + ip); refresh(); refreshAudit(); document.getElementById('f-ip').value = ''; document.getElementById('f-host').value = ''; }
   else toast('Error blocking', false);
 }
 
 async function toggleMaintenance() {
   const method = maintActive ? 'DELETE' : 'POST';
   const r = await api('/ddos-proxy/admin/maintenance', { method });
-  if (r.ok) { toast('Maintenance ' + (maintActive ? 'disabled' : 'enabled')); refresh(); }
+  if (r.ok) { toast('Maintenance ' + (maintActive ? 'disabled' : 'enabled')); refresh(); refreshAudit(); }
   else toast('Error toggling maintenance', false);
 }
 
 async function blockKey(key) {
   const [ip, host] = key.split('|');
   const r = await api('/ddos-proxy/admin/block', { method: 'POST', body: JSON.stringify({ ip, host }) });
-  if (r.ok) { toast('Blocked ' + key); refresh(); }
+  if (r.ok) { toast('Blocked ' + key); refresh(); refreshAudit(); }
   else toast('Error', false);
 }
 
 async function unblockKey(key) {
   const [ip, host] = key.split('|');
   const r = await api('/ddos-proxy/admin/block', { method: 'DELETE', body: JSON.stringify({ ip, host }) });
-  if (r.ok) { toast('Unblocked ' + key); refresh(); }
+  if (r.ok) { toast('Unblocked ' + key); refresh(); refreshAudit(); }
   else toast('Error', false);
 }
 

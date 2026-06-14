@@ -15,6 +15,7 @@ use minijinja::{context, Environment};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 
+use crate::audit::AuditLog;
 use crate::body::{empty, full, BoxedBody};
 use crate::config::Config;
 use crate::discord::DiscordAlerter;
@@ -52,6 +53,8 @@ pub struct Manager {
     dyn_trust: std::sync::RwLock<Vec<(String, IpCidr)>>,
     /// Per-path rate-limit counters, aligned with `cfg.path_rate_limits`.
     path_rates: Vec<PathRate>,
+    /// Ring buffer of recent admin API actions for audit/compliance purposes.
+    audit_log: AuditLog,
     /// Unix second the manager started (for uptime reporting).
     started_at_unix: i64,
     /// Shared HTTP client for Turnstile siteverify calls. Built once and reused so
@@ -130,6 +133,7 @@ impl Manager {
             dyn_deny: std::sync::RwLock::new(Vec::new()),
             dyn_trust: std::sync::RwLock::new(Vec::new()),
             path_rates,
+            audit_log: AuditLog::new(crate::audit::AUDIT_LOG_CAPACITY),
             started_at_unix: now_unix(),
             mitigation_until: AtomicI64::new(0),
             mitigation_started_at: AtomicI64::new(0),
@@ -1586,6 +1590,16 @@ impl Manager {
             self.unblock_l4(ip);
         }
         tracing::info!(ip = ip, host = host, "Admin: manually unblocked IP");
+    }
+
+    /// Append an entry to the admin action audit log.
+    pub fn record_audit(&self, action: &str, operator_ip: &str, detail: Option<String>) {
+        self.audit_log.record(action, operator_ip, detail);
+    }
+
+    /// Return recent admin actions, newest first. Used by `GET /ddos-proxy/admin/audit`.
+    pub fn list_audit(&self) -> Vec<crate::audit::AuditEntry> {
+        self.audit_log.list()
     }
 }
 
